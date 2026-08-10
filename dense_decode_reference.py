@@ -42,7 +42,7 @@ BLOCK_N = 128
 @triton.jit
 def _dense_decode_attn_kernel(
     Q_ptr, K_ptr, V_ptr, O_ptr,
-    seq_len, sm_scale,
+    seq_len: tl.int64, sm_scale,
     D_HEAD: tl.constexpr, GQA_GROUP: tl.constexpr,
     N_KV_HEADS: tl.constexpr, N_HEADS: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
