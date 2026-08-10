@@ -26,43 +26,47 @@ N_KV_HEADS = 8
 GQA_GROUP = N_HEADS // N_KV_HEADS
 D_HEAD = 128
 SINK_SIZE = 4
+BLOCK_N = 128
 
 CONTEXT_LENGTHS = [8_192, 16_384, 32_768, 65_536, 131_072, 163_840]
 WINDOW_SIZES = [0, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 
 
 @triton.jit
-def _kv_indices(seq_len, WINDOW: tl.constexpr, SINK: tl.constexpr, PADDED_KV: tl.constexpr):
-    """Cache-slot indices this query attends to, plus a validity mask.
+def _kv_indices(seq_len, slot_start, WINDOW: tl.constexpr, SINK: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Physical cache slot numbers for one BLOCK_N-sized chunk starting at
+    slot_start (0, BLOCK_N, 2*BLOCK_N, ...), plus a validity mask.
 
-    Returns PHYSICAL slot numbers into the compacted [SINK+WINDOW] cache
-    (i.e. just `slot` itself, 0..SINK+WINDOW-1) — NOT logical sequence
-    positions. The compacted cache is already laid out in slot order (slot i
-    holds whatever token is currently kept there), so _load_kv_tile can use
-    this directly as an offset. An earlier version of this function returned
-    the logical position instead (e.g. ~8000 for a late window slot at
-    seq_len=8192) and _load_kv_tile multiplied that directly into the offset
-    math — reaching far past the actual 260-slot buffer and causing a real
-    illegal-memory-access on hardware. Logical position is still needed, but
-    only internally, to decide whether a physical slot's content is valid
-    yet — never to compute an address.
+    Returns PHYSICAL slot numbers into the compacted [SINK+WINDOW] cache —
+    NOT logical sequence positions. The compacted cache is already laid out
+    in slot order (slot i holds whatever token is currently kept there), so
+    _load_kv_tile can use this directly as an offset. An earlier version of
+    this function returned the logical position instead (e.g. ~8000 for a
+    late window slot at seq_len=8192) and _load_kv_tile multiplied that
+    directly into the offset math — reaching far past the actual buffer and
+    causing a real illegal-memory-access on hardware. Logical position is
+    still needed, but only internally, to decide whether a physical slot's
+    content is valid yet — never to compute an address.
 
-    tl.arange requires a power-of-2 range, but SINK+WINDOW usually isn't one
-    (e.g. 4+256=260) — so the array is padded up to PADDED_KV (the caller's
-    job: next_pow2(SINK+WINDOW)) and the padding lanes are masked invalid,
-    same mechanism as the ramp-up masking below, not a separate special case.
-    Padding lanes get their returned slot clamped to 0 (always a real,
-    in-bounds slot) rather than left unmasked, so a masked-off lane's
-    *address* is still safe even though its value is discarded.
+    BLOCK_N is fixed (a real constant, always a power of 2) rather than
+    SINK+WINDOW itself, which usually isn't one (e.g. 4+256=260) and would
+    violate tl.arange's power-of-2 requirement directly. Chunking by a fixed
+    BLOCK_N sidesteps that entirely, and also avoids materializing the whole
+    (SINK+WINDOW, D_HEAD) tile at once, which hits Triton's max single-tensor
+    size at large WINDOW (spec.md's SRAM-footprint-should-be-tile-bounded
+    concern, deferred from the single-block version — this is that follow-up).
+    The last chunk naturally runs past SINK+WINDOW when it doesn't divide
+    evenly by BLOCK_N; in_bounds masks that off the same way the ramp-up
+    transient is masked below, not a separate special case.
 
-    Real (non-padding) size (SINK+WINDOW): ramp-up (seq_len <= SINK+WINDOW,
-    nothing evicted yet) is handled by masking:
+    Real (in-bounds) slots: ramp-up (seq_len <= SINK+WINDOW, nothing evicted
+    yet) is handled by masking:
       - sink slots invalid once >= seq_len (not generated yet)
       - window slots invalid if < SINK (already covered by the sink block —
         avoids double-counting before the window's grown past it)
     Steady state (seq_len > SINK+WINDOW) makes everything valid.
     """
-    slot = tl.arange(0, PADDED_KV)
+    slot = slot_start + tl.arange(0, BLOCK_N)
     in_bounds = slot < (SINK + WINDOW)
     is_sink = slot < SINK
 
@@ -94,7 +98,7 @@ def _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD: tl.constexp
 
     k = tl.load(K_cache_ptr + offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0)
 
-    # slot_idx: (PADDED_KV,) -> (PADDED_KV, D_HEAD), one address per
+    # slot_idx: (BLOCK_N,) -> (BLOCK_N, D_HEAD), one address per
     # (slot, head-dim element) pair, matching the tile shape v needs to be.
     v = tl.load(V_cache_ptr + offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0)
 
@@ -105,9 +109,9 @@ def _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD: tl.constexp
 def _sparse_decode_attn_kernel(
     Q_ptr, K_cache_ptr, V_cache_ptr, O_ptr,
     seq_len, sm_scale,
-    WINDOW: tl.constexpr, SINK: tl.constexpr, PADDED_KV: tl.constexpr,
+    WINDOW: tl.constexpr, SINK: tl.constexpr,
     D_HEAD: tl.constexpr, GQA_GROUP: tl.constexpr,
-    N_HEADS: tl.constexpr, N_KV_HEADS: tl.constexpr,
+    N_HEADS: tl.constexpr, N_KV_HEADS: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     # One program per (batch, query head) — no query-tiling, decode's
     # seq_len_q=1 gives nothing to tile over.
@@ -119,25 +123,27 @@ def _sparse_decode_attn_kernel(
     d_idx = tl.arange(0, D_HEAD)
     q = tl.load(Q_ptr + q_offset + d_idx)
 
-    # Fixed-size (SINK+WINDOW,) index + validity arrays — see _kv_indices.
-    # NOTE: this loads the whole sink+window range in one shot, no BLOCK_N
-    # tiling. Fine for getting things correct first, but spec.md's Phase 3
-    # explicitly wants the kernel's SRAM footprint checked against real
-    # FlashAttention's tile-bounded (not context-bounded) behavior — for
-    # large WINDOW that likely means this needs to become a tl.range loop
-    # over BLOCK_N-sized chunks of (idx, valid), with the running m_i/l_i
-    # accumulation the dense tutorial kernel uses, rather than one big block.
-    # Worth coming back to once this version is verified correct.
-    slot_idx, valid = _kv_indices(seq_len, WINDOW, SINK, PADDED_KV)
-    k, v = _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD, pid_batch, kv_head, WINDOW, SINK, N_KV_HEADS)
+    m_i = float("-inf")
+    l_i = 0.0
+    acc = tl.zeros([D_HEAD], dtype=tl.float32)
 
-    qk = tl.sum(q[None, :] * k, axis=1) * sm_scale
-    qk = tl.where(valid, qk, float("-inf"))
-    m_i = tl.max(qk, axis=0)
-    p = tl.math.exp(qk - m_i)
-    p = tl.where(valid, p, 0.0)
-    l_i = tl.sum(p, axis=0)
-    acc = tl.sum(p[:, None] * v, axis=0)
+    # Chunked over BLOCK_N-sized slices of the SINK+WINDOW cache, online-
+    # softmax accumulation — see _kv_indices for why (tile-bounded SRAM
+    # footprint, per spec.md's Phase 3 ask, and the max-single-tensor-size
+    # limit this replaced the single-block version to fix).
+    cache_size = SINK + WINDOW
+    for slot_start in tl.range(0, cache_size, BLOCK_N):
+        slot_idx, valid = _kv_indices(seq_len, slot_start, WINDOW, SINK, BLOCK_N)
+        k, v = _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD, pid_batch, kv_head, WINDOW, SINK, N_KV_HEADS)
+
+        qk = tl.sum(q[None, :] * k, axis=1) * sm_scale
+        qk = tl.where(valid, qk, float("-inf"))
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=0))
+        p = tl.math.exp(qk - m_ij)
+        alpha = tl.math.exp(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        m_i = m_ij
 
     o = acc / l_i
     tl.store(O_ptr + q_offset + d_idx, o)
@@ -150,15 +156,12 @@ def sparse_decode_attention(q, k_cache, v_cache, seq_len, window, sink=SINK_SIZE
     if sm_scale is None:
         sm_scale = D_HEAD**-0.5
     grid = (BATCH, N_HEADS)
-    # tl.arange needs a power-of-2 range; SINK+WINDOW usually isn't one, so
-    # round up (padding lanes are masked invalid inside _kv_indices).
-    padded_kv = 1 << (window + sink - 1).bit_length()
     _sparse_decode_attn_kernel[grid](
         q, k_cache, v_cache, o,
         seq_len, sm_scale,
-        WINDOW=window, SINK=sink, PADDED_KV=padded_kv,
+        WINDOW=window, SINK=sink,
         D_HEAD=D_HEAD, GQA_GROUP=GQA_GROUP,
-        N_HEADS=N_HEADS, N_KV_HEADS=N_KV_HEADS,
+        N_HEADS=N_HEADS, N_KV_HEADS=N_KV_HEADS, BLOCK_N=BLOCK_N,
     )
     return o
 
@@ -205,8 +208,8 @@ def benchmark():
             gap_pct = 100 * (measured_ratio - predicted_ratio) / predicted_ratio
 
             # Gap-hunting *why* gap_pct is nonzero is the actual Phase 3/4
-            # content (kernel launch overhead, the still-untiled single-block
-            # sparse kernel, boundary masking, etc.) — not resolved here.
+            # content (kernel launch overhead, BLOCK_N tiling granularity,
+            # boundary masking, etc.) — not resolved here.
             results.append({
                 "L": L, "W": W,
                 "ms_sparse": ms_sparse, "ms_dense": ms_dense,
