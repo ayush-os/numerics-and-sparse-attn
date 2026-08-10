@@ -221,5 +221,22 @@ def benchmark():
     return results
 
 
+def _print_and_save(results, path="benchmark_results.csv"):
+    import csv
+
+    header = ["L", "W", "ms_sparse", "ms_dense", "measured_ratio", "predicted_ratio", "gap_pct"]
+    print(f"{'L':>7} {'W':>7} {'ms_sparse':>10} {'ms_dense':>10} "
+         f"{'meas_ratio':>11} {'pred_ratio':>11} {'gap_%':>8}")
+    for r in results:
+        print(f"{r['L']:>7} {r['W']:>7} {r['ms_sparse']:>10.4f} {r['ms_dense']:>10.4f} "
+             f"{r['measured_ratio']:>11.3f} {r['predicted_ratio']:>11.3f} {r['gap_pct']:>8.2f}")
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"\nSaved {len(results)} rows to {path}")
+
+
 if __name__ == "__main__":
-    benchmark()
+    _print_and_save(benchmark())
