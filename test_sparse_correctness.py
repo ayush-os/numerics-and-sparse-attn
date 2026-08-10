@@ -81,11 +81,15 @@ def test_sparse_attention_correctness():
 
     # Covers pre-sink, mid-ramp-up (cache not yet full, nothing evicted),
     # and steady-state (sink/window disjoint) — the three regimes _kv_indices
-    # has to handle differently.
+    # has to handle differently. Plus W=0 explicitly (SINK+WINDOW=4, the
+    # tightest possible cache — never covered before this, and the kind of
+    # boundary that's bitten every other part of this kernel so far).
     test_cases = [
         (2, 256),
         (100, 256),
         (5_000, 256),
+        (2, 0),
+        (10_000, 0),
     ]
 
     all_passed = True
