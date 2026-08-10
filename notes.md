@@ -112,3 +112,111 @@ wants to compare against that specific number, QKVO will need the same correctio
 
 **Checkpoint reached**: sparsity mechanism chosen and defended, GPU environment
 identified, MLA-carry-forward plan set.
+
+---
+
+## Phase 1 — Hand-derive the sparsity lever (in isolation)
+
+### Setup
+
+Reused workload constants (`decode_notes.md` §0, unchanged): batch=32, n_heads=64,
+n_kv_heads=8, d_head=128, precision=int8 (1 byte). Sink size S=4 (StreamingLLM's real
+default). `seq_len_q = 1` (decode's defining feature — fixed, sparsity does not touch it,
+since sparsity prunes which keys/values one query attends to, not how many queries exist).
+`seq_len_kv = min(L, W+S)` in general; for the sweep range (L from 8,192 to 163,840, any
+sane window size), `L ≫ W+S` for essentially the entire sweep except the first `S+W`
+decode steps of any conversation (a fixed, self-resolving ramp-up transient, same
+category as `decode_notes.md` §2.2's ramp-up note) — so `seq_len_kv = S+W` is used
+directly.
+
+Terminology note (self-corrected mid-derivation): Q/K/V/O are **activations**, not
+weights — SDPA has no weight matrices; QKVO *projection* weights are exactly what's out
+of scope. Total bytes moved = Q(load) + K(load) + V(load) + O(write) — four tensors, not
+three; O is structurally identical to Q (same shape, `seq_len_q`-sized, unaffected by
+window size).
+
+### FLOPs
+
+```
+FLOPs(W) = 4 × batch × n_heads × d_head × (W + 4)
+         = 1,048,576 × (W + 4)
+```
+(QK^T FLOPs = PV FLOPs, general structural identity per `decode_notes.md` §1.1 — total is
+2× the per-matmul term.)
+
+### Bytes
+
+```
+c = 2 × d_head × n_kv_heads × precision = 2,048 bytes/position/layer   [Decision-3 param]
+
+Bytes(W) = [2 × batch × n_heads × d_head × precision]   (Q+O, fixed, = 524,288)
+         + [batch × c] × (W + 4)                          (K+V, = 65,536 × (W+4))
+         = 786,432 + 65,536 × W
+```
+
+**Sanity check**: setting `W+4 = 8192` (window = full dense context) recovers
+`decode_notes.md`'s own dense GQA numbers *exactly* — FLOPs → 2³³, bytes → 537,395,200 B
+(0.5005 GiB). Confirms the algebra is consistent with the formulas being reused.
+
+### Arithmetic Intensity
+
+```
+AI(W) = FLOPs(W) / Bytes(W) = 16(W+4) / (W+12)
+```
+
+### Key Findings — Phase 1
+
+1. **Sparsity is a FLOPs lever too, not just a bytes lever (unlike GQA)** — but FLOPs and
+   the *variable* part of bytes both scale linearly with `seq_len_kv` at the same rate,
+   while bytes carries a fixed Q+O floor (524,288) that FLOPs has no analog of. That
+   asymmetry is the entire mechanism behind finding #2.
+2. **AI(W) is strictly increasing in W, bounded above by exactly 16** — dense GQA's own
+   AI ceiling (`decode_notes.md`'s 15.98 at L=8,192 already sits at 99.9% of this
+   ceiling). Sparsity can only *approach* dense GQA's AI (as W grows toward full
+   context), never exceed it. At W=256: AI≈15.52. At W=32: AI≈13.09. At W=0 (sink only):
+   AI≈5.33.
+3. **Sparse attention's AI can never clear the ridge point (480.5), for any window size,
+   at any context length** — the ceiling (16) already sits ~30× below ridge. Same
+   structural flavor as `decode_notes.md` Phase 3's quantization-proof floor, but for
+   sparsity instead of precision. This fully answers Phase 1's "does sparse AI clear the
+   ridge" question: no, structurally, by construction.
+4. **The context-length sweep (8,192 → 163,840) is a non-event for AI** — the formula has
+   no `L` dependence at all once `L ≥ S+W`. Confirmed numerically at both endpoints with
+   W=256 fixed: AI≈15.52 at both L=8,192 and L=163,840, identical.
+5. **But the *absolute savings ratio* (dense/sparse) grows linearly with L** — confirmed
+   numerically: dense/sparse FLOPs ratio ≈31.5× at L=8,192 vs. ≈630× at L=163,840 (a 20×
+   growth, tracking the L ratio itself almost exactly, since dense cost scales linearly
+   with L while sparse cost is pinned flat at S+W). This is the real content of the
+   sweep, and directly confirms the spec's own opening premise — "sparsity's value
+   proposition is context-length-dependent" — with an actual derived number behind it.
+6. **The compute-bound-asymptote check (spec's "does something else become the
+   bottleneck first") is moot for Phase 1/sparsity alone** — since AI never clears the
+   ridge under sparsity by itself, there's no "far enough above ridge" case to check.
+   Becomes a live question only in Phase 2, once numerics stacks on top and might
+   actually push combined AI across the ridge.
+7. **The disagg §1.4 HBM-capacity-crossover sub-question ("does the crossover context
+   length match where dense KV cache dominates HBM budget") — judged moot, skipped.**
+   Its premise (a discrete crossover context length) doesn't survive finding #4 (no
+   crossover exists — AI is L-invariant, savings grow smoothly/continuously, not via a
+   switch-flip point). Also mechanistically circular: sparsity's absolute savings *are*
+   driven by the same growing dense-bytes quantity that eats HBM capacity — not two
+   independently-derived numbers that happen to coincide.
+
+**Phase 1 checkpoint: reached.** Formula derived (FLOPs/bytes as function of W and
+context length), stated finding on FLOPs-vs-bytes-lever (both, but bounded), sweep done,
+compute-bound-asymptote and capacity-crossover sub-questions resolved as moot with
+reasoning kept on record (not silently dropped).
+
+---
+
+## Open Threads Carried Forward
+
+- Phase 4's MLA substitution needs an additive indexer-overhead term (DeepSeek's
+  published numbers), not a pure `c` swap — flagged in Decision 3, not yet quantified.
+- If Phase 4 wants to compare against disagg's authoritative 830.59 req/s/chip / 5.82:1
+  numbers, QKVO needs to be added back in the same way disagg did for dense decode.
+- Phase 2 starts from a **worse** position than `decode_notes.md`'s original Phase 3:
+  sparse AI is always ≤16 (never above dense GQA's own ceiling), so the numerics
+  crossover point derived in Phase 2 may need to be *even more* extreme than decode's
+  already-unrealizable ~0.033 bytes/element floor. Real tension to derive properly, not
+  assume either direction.
