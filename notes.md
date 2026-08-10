@@ -397,6 +397,232 @@ recent ~128 tokens** — not the crossover-derived `p(W)` (which is unrealizable
 for any practical W), and not an idealized uniform-precision cache (which Phase 2 just
 showed overstates savings by >2× once the residual is real).
 
+---
+
+## Phase 3 — real Triton kernel
+
+### Decision 2, resolved: cloud A100
+
+User had "whatever GPU, willing to pay" — recommended A100 (80GB preferred, 40GB
+workable) over H100: decode is memory-bandwidth-bound end to end (Phase 1's own
+finding), so frontier compute isn't the bottleneck; A100's ~2TB/s HBM bandwidth is
+plenty, and it's the cheaper, more standard, better-documented choice for iterative
+kernel dev. Sizing check: dense baseline's K/V tensors alone at the sweep's largest
+context (L=163,840) are ≈20 GiB (`BATCH·N_KV_HEADS·L·D_HEAD·2·2`), so anything under
+~32GB VRAM was a real OOM risk, not theoretical. Ran on a Paperspace A100 instance.
+
+### Reference-kernel decision — not a straight fork, and why
+
+Per spec, Phase 3 should start from a published kernel and modify, not write from
+scratch. Two real candidates checked, both rejected as *modification targets* for
+different reasons:
+
+- **Triton docs tutorial (`06-fused-attention.py`)**: real, vendored into the repo
+  (`triton_fused_attention_tutorial.py`), but prefill-shaped (tiles over `BLOCK_M` query
+  rows, serial K/V loop) — decode's `seq_len_q=1` collapses the query-tile dimension to
+  nothing, and it has no GQA support at all (requires Q/K/V to share head count). Kept in
+  the repo but not used as the active dense baseline.
+- **vLLM's `triton_unified_attention.py`**: GQA-native and decode-shaped (has
+  `SLIDING_WINDOW`/`USE_SINKS` built in, split-KV via `IS_3D`), which would have
+  defeated the point of writing the sparsity mechanism ourselves. Also, on closer
+  inspection, carries ~1,600 lines across itself and a helper module (alibi, softcap,
+  qq_bias, paging, quantization, a hardware-specific tensor-descriptor load path, 2D/3D
+  split-KV toggle) — extracting/simplifying that blind, with no GPU access to verify the
+  simplification, risked a silently-wrong "real" reference, which defeats the actual
+  point of starting from a real system.
+
+**Resolution**: user gave explicit permission to deviate from "must be a real fetched
+kernel" — spec is a starting point, not gospel. Built two purpose-built files instead,
+each informed by patterns in the real kernels above (GQA head-group indexing,
+online-softmax accumulation) but small enough to reason about correctness without
+hardware:
+- `phase3_kernel_scaffold.py` — the sparse sliding-window+sink kernel, written
+  collaboratively (see next section for the given/theirs split).
+- `dense_decode_reference.py` — the dense-causal-GQA baseline (comparison target (b)),
+  written directly (no sparsity-selection content to preserve as the user's own work).
+
+### Scaffold design — given vs. theirs
+
+Per this project's own methodology (assistant as sounding-board/checker for 🧠 work, not
+derivation engine), the scaffold split boilerplate from content explicitly:
+- **Given** (filled in directly): grid/launch mechanics, online-softmax bookkeeping,
+  benchmark harness plumbing (tensor construction once shapes were fully determined,
+  `do_bench` calls), the dense reference kernel in full.
+- **Theirs** (left as stubs, user-derived): `_kv_indices` — which cache slots a query
+  attends to given `(seq_len, WINDOW, SINK)`, including the ramp-up transient. First
+  attempt caught and corrected (missing ramp-up handling, per notes.md's own Phase 1
+  ramp-up framing) before being handed back to fill in fully.
+- **Explicitly declined to fill in even when asked**: the comparison-against-predictions
+  logic (deciding what predicted quantity to check measured wall-clock against, and
+  interpreting any gap) — this is the actual point of Phase 3/4, not incidental to it.
+  Also declined to write `test_sparse_correctness.py`'s reference mask myself even after
+  being asked directly — an independent check written by the same source as the thing
+  being checked isn't independent; the mask was instead sourced from a real third party
+  (`mit-han-lab/streaming-llm`'s own `kv_cache.py`), confirming the ramp-up assumption
+  exactly (no eviction, full dense attention, until `seq_len` exceeds `sink+window`) and
+  giving the reference an actual chance to catch a shared mistake, not just restate one.
+
+### Staged build order
+
+Explicit user call, mirroring the project's own Phase 1→Phase 2 structure: get
+sliding-window+sink correct and benchmarked at native fp16 precision first, defer KIVI
+quant (2-bit main + int8 residual) to a second pass on top of a known-good kernel.
+Reasoning given at the time: isolates debugging surface (a wrong-output bug can only be
+in one of two now-separable systems, not an ambiguous mix of both), and produces a real,
+measured Phase-1-only checkpoint before quant complicates the picture. **Quant has not
+been started** — this is still the next real chunk of Phase 3 work.
+
+### Real bugs found via iterative hardware testing — full list, root causes
+
+Every one of these was invisible by inspection and only surfaced once actually run on
+the A100. Listed in the order found, since several build on each other:
+
+1. **Missing `kv_head` offset + missing head-dim broadcast** in `_load_kv_tile`'s first
+   draft — every query head in a GQA group besides head 0 would've silently read the
+   wrong KV head's cache; the load was also computing one address per slot instead of
+   one per `(slot, head-dim-element)` pair.
+2. **`tl.arange(seq_len - WINDOW, seq_len)` — Triton requires `tl.arange` bounds to be
+   compile-time constants**, but `seq_len` is a runtime kernel argument. Fixed via the
+   standard idiom: a compile-time-sized `tl.arange` plus a runtime-offset add, not a
+   runtime-bounded range.
+3. **Bare Python globals (`N_HEADS`, `N_KV_HEADS`) referenced inside `@triton.jit`
+   functions** — this specific Triton version rejects that outright (`NameError`);
+   needed explicit `tl.constexpr` parameters threaded through every call site instead.
+4. **`tl.cat` requires `can_reorder=True`, and even then doesn't guarantee the same
+   reordering across two separate calls** — a real risk of `idx[i]`/`valid[i]` silently
+   decoupling if the `idx` and `valid` concatenations reordered differently. Fixed by
+   building both from one shared `tl.arange`-derived index via `tl.where`, removing the
+   ambiguity rather than just silencing the compiler.
+5. **`tl.arange`'s range must be a power of 2** — `SINK+WINDOW` (e.g. 4+256=260) usually
+   isn't one. First fix: pad to `next_pow2(SINK+WINDOW)` and mask the padding invalid
+   (same mechanism as ramp-up masking). Superseded by fix #7 below.
+6. **The real headline bug: `_kv_indices` returned logical sequence positions, not
+   physical cache slots.** Present since the very first draft (`tl.arange(seq_len-WINDOW,
+   seq_len)` was always a logical position). `_load_kv_tile` multiplied that directly
+   into its offset math as if it were a physical array index — at `seq_len=8192,
+   window=256`, window slots got `idx` values like 7936–8191, used as offsets into a
+   260-slot buffer. Caused a real CUDA illegal-memory-access, confirmed via
+   `CUDA_LAUNCH_BLOCKING=1`. Every intermediate fix (masking, padding) preserved this
+   same underlying confusion instead of catching it — it took an actual crash to surface
+   it. Fix: `_kv_indices` returns the physical slot number directly (the compacted cache
+   is already laid out in slot order — `slot i` holds whatever's currently kept there);
+   logical position is still computed internally, but only to decide *validity*, never
+   to compute an address.
+7. **Triton's max single-tensor size (1,048,576 elements) exceeded at large `WINDOW`**
+   — the single-block design materialized the whole `(PADDED_KV, D_HEAD)` tile at once;
+   at `W=8192`, `PADDED_KV=16384 × D_HEAD=128 = 2,097,152`, over the limit. This was the
+   deferred SRAM-footprint concern flagged in the kernel's own comments from the start
+   (spec.md's "check tile-bounded, not context-bounded" ask) — correctness was verified
+   first, then this became the real follow-up. Fixed by restructuring to a `BLOCK_N=128`
+   tiled loop with running online-softmax accumulation (`m_i`/`l_i`/`acc`), mirroring
+   `dense_decode_reference.py`'s own structure. This also **eliminated** the `PADDED_KV`
+   workaround from fix #5 entirely — a fixed power-of-2 `BLOCK_N` satisfies `tl.arange`'s
+   constraint on its own, regardless of `SINK+WINDOW`'s actual value.
+8. **int32 overflow in the dense kernel's offset arithmetic at large context lengths.**
+   Triton's default integer arithmetic is 32-bit. `kv_base = pid_batch * N_KV_HEADS *
+   seq_len * D_HEAD + ...` overflows int32 (~2.1B) once `seq_len` gets large enough — at
+   `L=131,072` the dominant term alone is ≈4.16B. Silently wraps into a garbage address
+   rather than erroring cleanly. Crossover for this workload's sizes: `L≈67,653`
+   (between the sweep's `65,536` and `131,072`). This is why an isolated smoke test at
+   `L=8,192` passed clean while the full `CONTEXT_LENGTHS` sweep didn't — confirmed via
+   `CUDA_LAUNCH_BLOCKING=1` pinning the fault precisely to `_dense_decode_attn_kernel`'s
+   own launch. Fixed by typing `seq_len: tl.int64` in the kernel signature (matches
+   vLLM's own real convention of typing every stride parameter `tl.int64` rather than
+   leaving them default-width — noticed in passing while reading that kernel earlier,
+   didn't carry the lesson into our own kernels until this bug forced it). **The sparse
+   kernel is structurally immune to this one for the current sweep** — its offset math
+   is bounded by `SINK+WINDOW` (≤16,388), never the full context length, so it never
+   approaches int32 range regardless of `L`. Not a guarantee if `WINDOW_SIZES` ever grows
+   much larger, just not a live issue at current values — the cache-compaction that's
+   the whole point of the sparsity mechanism is what buys this safety margin.
+9. **`sparse_decode_attention` reused the plain `_load_kv_tile`/`_kv_indices` names
+   across a signature change** (parameters added for `N_KV_HEADS`, `BLOCK_N`, etc.) —
+   several rounds of "argument missing" errors from call sites not being updated in
+   lockstep with signature changes. Mechanical, not conceptual, but contributed real
+   iteration count.
+
+### Correctness verification
+
+**`test_sparse_correctness.py`**: harness (random inputs, compacted-cache construction,
+comparison) filled in directly; the reference's attention mask sourced from
+`mit-han-lab/streaming-llm`'s real `kv_cache.py` (`StartRecentKVCache.__call__`), not
+derived by either the user or the assistant, for genuine independence. Adversarial
+`GARBAGE_VALUE` (not random data) planted in slots that should be masked out, so a
+masking bug produces an obviously-wrong output rather than a coincidental pass. Test
+cases cover pre-sink, mid-ramp-up, steady-state, and (added after the fact, closing a
+flagged coverage gap) `W=0` — the tightest possible cache (`SINK+WINDOW=4`), never
+covered until explicitly checked. **All pass** (max abs diff 0.001–0.004, consistent
+with fp16 rounding against an fp32 reference, well under the 1e-2 tolerance).
+
+**`test_dense_correctness.py`**: written entirely by the assistant — no sparsity-
+selection content in dense causal+GQA attention, so no reason to hold it back. GQA
+handled via reshape+einsum broadcast rather than `repeat_interleave`, to avoid
+materializing an 8×-larger K/V copy at the large-`seq_len` case (`repeat_interleave`
+would need ~128GiB at `L=131,072`; the broadcast approach needs ~1GiB). Includes
+`seq_len=131,072` specifically — past the int32 overflow crossover — to confirm the fix
+produces the *correct* result at that scale, not just that it no longer crashes. **All
+pass**, and notably the diff *shrinks* at scale (0.00003 at `L=131,072` vs. 0.0038 at
+`L=2`), reinforcing that the fix is real, not a coincidental non-crash.
+
+### Benchmark sweep — results and gap-hunt (in progress)
+
+Full `CONTEXT_LENGTHS × WINDOW_SIZES` sweep (66 points) ran clean after all bugs above
+were fixed. Results in `benchmark_results.csv` **on the remote GPU box only — not yet
+copied into the repo.** Predicted-bytes formula re-derived for this stage's actual
+precision (fp16 Q/O + fp16 K/V, not notes.md's original int8 assumption — the reused-
+number-needs-reverification trap, caught before it became a real error): `B_FIXED_FP16 =
+1,048,576`, `C_FP16 = 131,072` (both exactly 2× Phase 1's int8 constants, as expected).
+Compared via bytes ratio (not FLOPs ratio) as the predicted proxy for measured wall-clock
+ratio, since Phase 1 Finding #3 already established this regime never clears the
+roofline ridge — matches Phase 2's own "sparsity-alone" ratio methodology.
+
+**Findings so far:**
+
+1. **Dense-recovery sanity check passes clean on real hardware.** `L=8192,W=8192` and
+   `L=16384,W=16384` (sparse window covers the whole context, should collapse to dense)
+   give `gap_%` of 0.51% and 1.29% — the same sanity check Phase 1 used on the hand-
+   derived formulas, now confirmed on measured wall-clock time, not just algebra. Good
+   evidence the harness itself (tensor construction, timing methodology, the bytes-ratio
+   prediction) is sound, independent of whether individual kernels have bugs.
+
+2. **`gap_%` has a large, systematic pattern**: strongly negative at small `W` (as
+   extreme as -82% at `W=0`) — the hand-derived formula *overpredicts* the real speedup
+   — swinging positive at large `W` (up to +46%) — the formula *underpredicts*. The
+   crossover `W` (where `gap_%≈0`) shifts to smaller absolute values as `L` grows: ~900
+   at `L=8,192`, under 64 by `L=163,840`. Not yet fully resolved — see below.
+
+3. **A specific, confirmed sub-mechanism: `BLOCK_N=128` tiling creates a sawtooth in
+   `gap_%`, superimposed on the broader trend.** `gap_%` dips sharply at `W=128`
+   relative to *both* neighbors (`W=64`, `W=256`), on *every single `L`* in the sweep —
+   e.g. at `L=163,840`: `W=64→+7.98`, `W=128→-19.04`, `W=256→+5.98`. Root cause,
+   confirmed empirically (not just hypothesized) via a targeted `W=124/125/128/256`
+   sweep at `L=8,192`:
+   ```
+   W=64  → ms=0.0390
+   W=124 → ms=0.0569   (still 1 tile: SINK+WINDOW=128 exactly)
+   W=125 → ms=0.0947   (now needs 2 tiles: SINK+WINDOW=129)
+   W=128 → ms=0.0945   (same 2-tile band as W=125 — nearly identical time)
+   W=256 → ms=0.1400   (3rd tile boundary)
+   ```
+   A **+66% wall-clock jump from `W=124` to `W=125`** — a 1-unit change in nominal window
+   size — is definitively not explained by one extra token of real work; it's the tile
+   count (`ceil((SINK+WINDOW)/BLOCK_N)`) stepping from 1→2. `W=125` and `W=128` being
+   nearly identical (`0.0947` vs `0.0945`) confirms the flip side: cost is flat *within*
+   a tile-count band, only jumping at boundaries. Because `SINK=4` is small relative to
+   `BLOCK_N=128`, every power-of-2 `W≥128` in the sweep happens to land just 4 past a
+   fresh tile boundary — so every sampled point in that range is catching a boundary
+   penalty, and the *size* of that penalty shrinks with each successive boundary (`1→2`
+   tiles is a 100% relative jump, `2→3` is 50%, `3→4` is 33%, ... — ordinary `1/N`
+   arithmetic on a roughly-fixed per-tile overhead). The kernel's cost is a step function
+   of tile count; the hand-derived prediction assumes smooth linear-in-`W` cost; `gap_%`
+   is picking up exactly that mismatch.
+   **Not yet resolved**: whether this tiling artifact is the *whole* story behind
+   finding #2's broader trend, or whether there's an additional smooth component (e.g.
+   real launch-overhead amortization, achieved-bandwidth differences between the two
+   kernels) once the sawtooth is controlled for. `ms_sparse` at `W=0` sitting at ≈0.027ms
+   regardless of `L` (consistent with a pure launch-overhead floor, since real work at
+   `W=0` is negligible) is a flagged candidate for part of the story, not confirmed.
+
 ## Open Threads Carried Forward
 
 - Phase 4's MLA substitution needs an additive indexer-overhead term (DeepSeek's
@@ -405,8 +631,20 @@ showed overstates savings by >2× once the residual is real).
   non-independent) — needs the full `Bytes(W,p)` solve with MLA's `c`, from scratch.
 - If Phase 4 wants to compare against disagg's authoritative 830.59 req/s/chip / 5.82:1
   numbers, QKVO needs to be added back in the same way disagg did for dense decode.
-- Phase 3's kernel should implement KIVI-style quantization exactly as scoped above
-  (2-bit main + int8 residual, ~128 tokens) — real hardware numbers will show whether
-  this hand-derived residual-dilution effect is the whole story or whether real kernel
-  overhead (dequant cost, non-contiguous residual/main-buffer access) adds more on top.
-  That's a live "real vs. predicted gap" candidate for Phase 4 Q3.
+- **Phase 3's gap-hunt is incomplete**: the tiling-boundary sawtooth is confirmed, but
+  whether it fully explains the broader negative→positive `gap_%` trend (finding #2
+  above) or whether there's a separate smooth mechanism underneath it is still open.
+- **Phase 3's KIVI quant layer has not been implemented.** Per the staged plan, this was
+  deliberately deferred until the sparse-only kernel was verified correct and
+  benchmarked — that's now done, so this is the next real chunk of kernel work. Real
+  hardware numbers here will show whether Phase 2's hand-derived residual-dilution
+  effect (precision's marginal multiplier collapsing from ~3.81× to ~1.59× once layered
+  on sparsity) is the whole story or whether real kernel overhead (dequant cost,
+  non-contiguous residual/main-buffer access, 2-bit packing/unpacking — Triton has no
+  native sub-byte dtype, so this needs bit-packing 4 values/uint8 and unpacking in-kernel)
+  adds more on top. Live "real vs. predicted gap" candidate.
+- **Comparison target (c) — a published reference system — hasn't been started.**
+  spec.md named vLLM sliding window, StreamingLLM's own numbers, or ASA's ~50% figure as
+  candidates.
+- `benchmark_results.csv` (the full 66-point sweep) exists only on the remote GPU
+  instance, not yet copied into the repo.
