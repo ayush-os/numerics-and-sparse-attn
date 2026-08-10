@@ -209,14 +209,204 @@ reasoning kept on record (not silently dropped).
 
 ---
 
+## Phase 2 — Layer numerics on top, quantify the interaction
+
+### Setup — generalized bytes formula
+
+Generalized `Bytes(W)` from Phase 1 to make cache precision `p` (bytes/element) an
+explicit variable, separate from the fixed activation precision (`precision_act`=int8=1
+byte, unchanged, applies only to Q/O):
+
+```
+F(W)        = 4·batch·n_heads·d_head·(W+S)                [FLOPs, unchanged by p — decoupled
+                                                             model, dequant fused into matmul,
+                                                             per decode_notes.md §4.1]
+B_fixed     = 2·batch·n_heads·d_head·precision_act = 524,288 B   [Q+O, fixed, p-independent]
+c(p)        = 2·d_head·n_kv_heads·p                        [KV bytes/position/layer — p replaces
+                                                             the fixed int8 term Phase 1 used]
+Bytes(W,p)  = B_fixed + batch·c(p)·(W+S)
+AI(W,p)     = F(W) / Bytes(W,p)
+```
+
+Sanity check: `c(1) = 2,048` recovers Phase 1's `c` exactly (int8, p=1).
+
+### Crossover solve — reusing decode_notes.md §4.1/§4.2's method, new starting AI
+
+Solved `AI(W,p) = R` (ridge point, R=480.5, TPU v5e/int8, per decode_notes.md) for `p`:
+
+```
+p(W) = [2·n_heads/(R·n_kv_heads)]  −  [B_fixed/(2·batch·d_head·n_kv_heads)] / (W+S)
+     = A∞ − K/(W+S)                    where A∞ = 32/961 ≈ 0.03330, K = 8
+
+Plugged in:  p(W) = 32/961 − 8/(W+4)
+```
+
+**Sanity check (passed):** as `W→∞`, `p(W) → 32/961 ≈ 0.0333` — exactly recovers
+`decode_notes.md` Phase 3's own dense-GQA crossover floor (~0.033 bytes/element). This
+is the fully-dense edge case of the sparse formula (W = full context, no sparsity), not
+a coincidence — confirms the algebra is consistent with the reused number.
+
+**Key findings — crossover solve:**
+1. `p(W)` is strictly increasing in W, with `32/961` as a strict supremum, never attained
+   at finite W — sparse crossover is *always* more extreme than dense's already-
+   unrealizable floor, confirming the tension flagged in Phase 1's carried-forward notes.
+2. `p(W)` goes **negative** below a critical window size: `W* = K/A∞ − S = 236.25`. Below
+   `W≈236`, no precision — not even a hypothetical zero-byte one — gets sparse AI to
+   ridge. Above it, `p(W)` is positive but still far below any realizable quantization
+   (e.g. `p(256) ≈ 0.00253` bytes/element, ~0.02 bits/element — KIVI's own smallest
+   published group is 2-bit ≈ 0.25 bytes/element, ~100× larger).
+3. **Confirmed: precision cannot be a compute-bound lever here, at any window size.**
+   Same structural flavor as Phase 1's sparsity-alone finding, now shown for the combined
+   case too.
+
+### Multiplicative-vs-non-independent check
+
+Tested the naive hypothesis that combining levers just multiplies AI gains:
+`p_naive(W) = A∞ · AI(W)/16 = (32/961)·(W+4)/(W+12)` — a pure product form.
+
+Compared against the actual derived `p(W) = A∞ − 8/(W+4)` — a difference form, different
+denominator shape (`W+12` vs `W+4`) entirely; not the same function.
+
+Numerically, at W=256: `p_naive ≈ 0.03231` vs `p_actual ≈ 0.00253` — naive overstates by
+**~12.8×**. At W=32: `p_naive ≈ 0.02725` (still positive) vs `p_actual ≈ −0.18892`
+(negative/unreachable) — a *qualitative* divergence the naive model can't produce at all,
+since it never predicts a critical-window phenomenon.
+
+**Verdict: non-independent, confirmed.** Mechanism: same root cause as Phase 1 Finding
+#1 — the fixed `B_fixed` (Q+O) additive term in `Bytes(W,p)` breaks clean multiplicative
+separability between the W-lever and the p-lever, the same way it capped `AI(W)` at 16
+instead of letting it scale freely. One structural fact (the fixed Q+O floor), two
+separate manifestations (bounded AI in Phase 1, non-multiplicative crossover here).
+
+**Consequence for Phase 4:** the MLA `c`-substitution (Decision 3) cannot shortcut
+through an AI-ratio multiplier — it needs the full `Bytes(W,p)` solve redone with MLA's
+own cache-entry size, not a ratio trick, since the additive `B_fixed` term breaks that
+shortcut here and will break it there too.
+
+### Dominance check — does one lever swamp the other (disagg §2.5 echo)?
+
+Reused decode's own workload point; ran a 2×2 factorial (dense/sparse × normal/low
+precision) at W=256, `p_low=0.25` bytes/element (KIVI 2-bit), first idealized (whole
+window compressible), at two context lengths:
+
+**Idealized (no residual-buffer constraint), L=8,192:**
+```
+(a) dense,  p=1     = 537,395,200 B    [= decode_notes.md's own dense number, sanity check passed]
+(b) sparse, p=1     =  17,563,648 B
+(c) dense,  p=0.25  = 134,742,016 B
+(d) sparse, p=0.25  =   4,784,128 B
+
+sparsity-alone  = a/b = 30.597×
+precision-alone = a/c =  3.988×
+combined        = a/d = 112.33×
+naive product (30.597×3.988) = 122.03×  →  naive overstates by ~8.6%
+dominance ratio (sparsity/precision) = 7.67×
+```
+
+**Idealized, L=163,840** (b,d unchanged — Phase 1 Finding #4, AI/bytes-ratio formulas
+are L-invariant once L≥W+S):
+```
+(a) = 10,737,942,528 B     (c) = 2,684,878,848 B
+sparsity-alone  = 611.37×    precision-alone = 3.999× (L-invariant, as expected —
+                                                        B_fixed is negligible either way)
+combined        = 2,244.49×
+naive product (611.37×3.999) = 2,445.13×  →  naive overstates by ~8.9% (stable vs L=8,192)
+dominance ratio (sparsity/precision) = 152.9×
+```
+
+**Finding: dominance ratio grows linearly with L**, tracking the context-length ratio
+almost exactly (163,840/8,192 = 20×; dominance ratio grew 152.9/7.67 = 19.94×). Direct
+mechanism: precision-alone is L-invariant (pure function of p, B_fixed negligible either
+way); sparsity-alone scales with L (Phase 1 Finding #5). So the growing gap is entirely
+sparsity's own L-scaling, not a new effect.
+
+**Compute-bound-asymptote check (Phase 1 Finding #6, deferred here):** at the combined
+operating point, `AI(256, 0.25) = F(256)/Bytes(256,0.25) ≈ 272,629,760/4,784,128 ≈ 56.98`
+— still ~8.4× below ridge (480.5). Even with both realistic levers combined, decode stays
+solidly memory-bound. **Resolved: still moot**, not newly live.
+
+**Answer to the disagg-echo question: no, not FFN-style dominance.** Disagg's FFN
+dominance made attention "a rounding error" — negligible. Here precision's ~4× is real
+and substantial, just smaller in magnitude than sparsity's. Two comparably-important-but-
+unequal levers, not one swamping the other into irrelevance — the opposite shape from
+disagg's result, worth stating explicitly rather than folded into "sparsity wins."
+
+### Residual-buffer correction — KIVI's structural floor collides with a small window
+
+Phase 0 flagged this and deferred it: KIVI keeps the most recent ~128 tokens
+uncompressed (structural, not optional). At W=256, the total sparse cache is only
+`W+S=260` tokens — the 128-token residual is **~49% of the entire cache**, not a small
+tail as it would be in a normal (thousands-of-tokens) dense cache.
+
+**Precision choice for the uncompressed residual — a real judgment call, stated
+explicitly:** KIVI's own paper uses FP16 (2 bytes) as its native/residual precision, but
+*this project's* own baseline precision (established in Phase 1's reused workload
+constants) is int8 (1 byte). Used **int8** for the residual, consistent with this
+project's own operating point rather than importing KIVI's paper-native number
+unverified — the exact "reused number needs re-verification for the new context" trap
+the spec names.
+
+**Recomputed (c) and (d) with the mixed-precision split** (residual tokens at int8=1B,
+remainder at p_low=0.25B), L=8,192, W=256:
+```
+c_realistic: 128 tok × 2,048 B/tok(int8) + 8,064 tok × 512 B/tok(p_low)  → total 141,033,472 B
+             (+4.7% vs idealized 134,742,016 — small; residual is only ~1.6% of L=8,192)
+d_realistic: 128 tok × 2,048 B/tok(int8) + 132 tok × 512 B/tok(p_low)   → total  11,075,584 B
+             (+131.5% vs idealized 4,784,128 — large; residual is ~49% of W+S=260)
+```
+
+**Updated ratios:**
+```
+sparsity-alone            = a/b            = 30.597×  (unchanged — no quantization involved)
+precision-alone realistic = a/c_realistic  =  3.810×  (−4.5% vs idealized — dense case barely affected)
+combined realistic        = a/d_realistic  = 48.521×  (−56.8% vs idealized 112.33× — cut by more than half)
+
+naive product (realistic) = 30.597×3.810 = 116.59×
+actual combined realistic                = 48.52×
+naive overstates by ~140% (predicts >2.4× the real savings)
+```
+
+**Key finding:** sparsity's benefit is completely untouched by this (it never involves
+sub-int8 quantization). What collapses is *precision's marginal contribution once layered
+on top of sparsity*: precision's own effective multiplier drops from ~3.81× (applied to
+the full dense cache) to only **~1.59×** (`48.52/30.597`) once sparsity has already
+shrunk the cache to near the residual buffer's own size. Mechanism: this isn't a 50/50
+dilution — uncompressed tokens cost 4× more bytes per position than compressed ones
+(int8 vs 0.25B), so the ~49%-by-count residual claims a hugely disproportionate **share
+of bytes** (residual accounts for ~80% of `d_realistic`'s KV bytes despite being only
+half the token count). This is the concrete, quantified version of the "sparsity may be
+structurally hostile to the achievable compression ratio" concern flagged in Phase 0 —
+confirmed, not assumed.
+
+### Phase 2 checkpoint: reached
+
+**Stated, derived answer:** sparsity and numerics are **not independent, multiplicative
+levers** — confirmed two ways: (1) the crossover-precision solve is a difference form,
+not a product form, tracing to the same fixed Q+O bytes term that bounded Phase 1's AI;
+(2) once KIVI's residual-buffer structure is included (not just the idealized crossover
+math), precision's *marginal* savings on top of an already-sparsified cache collapse from
+~3.81× to ~1.59× — headroom genuinely eaten, not just algebraically non-clean. Neither
+lever dominates the other FFN-style (disagg §2.5 echo does *not* recur here) — both
+contribute real, comparable-order-of-magnitude savings, with sparsity's advantage over
+precision growing linearly with context length (20× dominance-ratio growth for a 20×
+context-length increase).
+
+**For Phase 3:** the realistic, non-floor-hitting KV-cache precision to actually
+implement is **KIVI's 2-bit (p=0.25 bytes/element) with an int8 residual for the most
+recent ~128 tokens** — not the crossover-derived `p(W)` (which is unrealizable/negative
+for any practical W), and not an idealized uniform-precision cache (which Phase 2 just
+showed overstates savings by >2× once the residual is real).
+
 ## Open Threads Carried Forward
 
 - Phase 4's MLA substitution needs an additive indexer-overhead term (DeepSeek's
   published numbers), not a pure `c` swap — flagged in Decision 3, not yet quantified.
+  **Sharpened by Phase 2**: also can't shortcut via an AI-ratio multiplier (confirmed
+  non-independent) — needs the full `Bytes(W,p)` solve with MLA's `c`, from scratch.
 - If Phase 4 wants to compare against disagg's authoritative 830.59 req/s/chip / 5.82:1
   numbers, QKVO needs to be added back in the same way disagg did for dense decode.
-- Phase 2 starts from a **worse** position than `decode_notes.md`'s original Phase 3:
-  sparse AI is always ≤16 (never above dense GQA's own ceiling), so the numerics
-  crossover point derived in Phase 2 may need to be *even more* extreme than decode's
-  already-unrealizable ~0.033 bytes/element floor. Real tension to derive properly, not
-  assume either direction.
+- Phase 3's kernel should implement KIVI-style quantization exactly as scoped above
+  (2-bit main + int8 residual, ~128 tokens) — real hardware numbers will show whether
+  this hand-derived residual-dilution effect is the whole story or whether real kernel
+  overhead (dequant cost, non-contiguous residual/main-buffer access) adds more on top.
+  That's a live "real vs. predicted gap" candidate for Phase 4 Q3.
