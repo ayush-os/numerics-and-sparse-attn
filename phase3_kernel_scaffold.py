@@ -40,23 +40,29 @@ def _kv_indices(seq_len, WINDOW: tl.constexpr, SINK: tl.constexpr):
       - sink slots invalid once >= seq_len (not generated yet)
       - window slots invalid if < SINK (already covered by the sink block —
         avoids double-counting before the window's grown past it)
-    Steady state (seq_len > SINK+WINDOW) makes everything valid — your
-    original tl.cat(arange, arange) line, unchanged.
-    """
-    sink_idx = tl.arange(0, SINK)
-    window_idx = (seq_len - WINDOW) + tl.arange(0, WINDOW)
-    idx = tl.cat(sink_idx, window_idx)
+    Steady state (seq_len > SINK+WINDOW) makes everything valid.
 
-    sink_valid = sink_idx < seq_len
-    window_valid = window_idx >= SINK
-    valid = tl.cat(sink_valid, window_valid)
+    Built from one tl.arange + tl.where rather than tl.cat-ing two separate
+    (sink, window) pieces: this Triton version's tl.cat doesn't guarantee
+    element order unless can_reorder=True, and even then there's no
+    guarantee the idx and valid concatenations reorder identically — a real
+    risk of idx[i]/valid[i] silently corresponding to different slots. One
+    shared `slot` index avoids that risk entirely rather than papering over it.
+    """
+    slot = tl.arange(0, SINK + WINDOW)
+    is_sink = slot < SINK
+    sink_pos = slot
+    window_pos = (seq_len - WINDOW) + (slot - SINK)
+
+    idx = tl.where(is_sink, sink_pos, window_pos)
+    valid = tl.where(is_sink, sink_pos < seq_len, window_pos >= SINK)
 
     return idx, valid
 
 
 @triton.jit
 def _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD: tl.constexpr, idx_in_batch, kv_head_idx,
-                  window: tl.constexpr, sink: tl.constexpr):
+                  window: tl.constexpr, sink: tl.constexpr, N_KV_HEADS: tl.constexpr):
     """Load a KV tile at these cache slots, from a [BATCH, N_KV_HEADS,
     SINK+WINDOW, D_HEAD] cache. `valid` marks which slots are real (see
     _kv_indices) — masked at load time (not just in the softmax weights),
@@ -81,6 +87,7 @@ def _sparse_decode_attn_kernel(
     seq_len, sm_scale,
     WINDOW: tl.constexpr, SINK: tl.constexpr,
     D_HEAD: tl.constexpr, GQA_GROUP: tl.constexpr,
+    N_HEADS: tl.constexpr, N_KV_HEADS: tl.constexpr,
 ):
     # One program per (batch, query head) — no query-tiling, decode's
     # seq_len_q=1 gives nothing to tile over.
@@ -102,7 +109,7 @@ def _sparse_decode_attn_kernel(
     # accumulation the dense tutorial kernel uses, rather than one big block.
     # Worth coming back to once this version is verified correct.
     slot_idx, valid = _kv_indices(seq_len, WINDOW, SINK)
-    k, v = _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD, pid_batch, kv_head, WINDOW, SINK)
+    k, v = _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD, pid_batch, kv_head, WINDOW, SINK, N_KV_HEADS)
 
     qk = tl.sum(q[None, :] * k, axis=1) * sm_scale
     qk = tl.where(valid, qk, float("-inf"))
@@ -128,6 +135,7 @@ def sparse_decode_attention(q, k_cache, v_cache, seq_len, window, sink=SINK_SIZE
         seq_len, sm_scale,
         WINDOW=window, SINK=sink,
         D_HEAD=D_HEAD, GQA_GROUP=GQA_GROUP,
+        N_HEADS=N_HEADS, N_KV_HEADS=N_KV_HEADS,
     )
     return o
 
