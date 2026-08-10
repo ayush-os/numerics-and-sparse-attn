@@ -35,12 +35,24 @@ WINDOW_SIZES = [0, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 def _kv_indices(seq_len, WINDOW: tl.constexpr, SINK: tl.constexpr, PADDED_KV: tl.constexpr):
     """Cache-slot indices this query attends to, plus a validity mask.
 
+    Returns PHYSICAL slot numbers into the compacted [SINK+WINDOW] cache
+    (i.e. just `slot` itself, 0..SINK+WINDOW-1) — NOT logical sequence
+    positions. The compacted cache is already laid out in slot order (slot i
+    holds whatever token is currently kept there), so _load_kv_tile can use
+    this directly as an offset. An earlier version of this function returned
+    the logical position instead (e.g. ~8000 for a late window slot at
+    seq_len=8192) and _load_kv_tile multiplied that directly into the offset
+    math — reaching far past the actual 260-slot buffer and causing a real
+    illegal-memory-access on hardware. Logical position is still needed, but
+    only internally, to decide whether a physical slot's content is valid
+    yet — never to compute an address.
+
     tl.arange requires a power-of-2 range, but SINK+WINDOW usually isn't one
     (e.g. 4+256=260) — so the array is padded up to PADDED_KV (the caller's
     job: next_pow2(SINK+WINDOW)) and the padding lanes are masked invalid,
     same mechanism as the ramp-up masking below, not a separate special case.
-    Padding lanes get idx clamped to 0 (always a real, in-bounds slot) rather
-    than left as whatever the raw arithmetic produces, so a masked-off lane's
+    Padding lanes get their returned slot clamped to 0 (always a real,
+    in-bounds slot) rather than left unmasked, so a masked-off lane's
     *address* is still safe even though its value is discarded.
 
     Real (non-padding) size (SINK+WINDOW): ramp-up (seq_len <= SINK+WINDOW,
@@ -49,35 +61,33 @@ def _kv_indices(seq_len, WINDOW: tl.constexpr, SINK: tl.constexpr, PADDED_KV: tl
       - window slots invalid if < SINK (already covered by the sink block —
         avoids double-counting before the window's grown past it)
     Steady state (seq_len > SINK+WINDOW) makes everything valid.
-
-    Built from one tl.arange + tl.where rather than tl.cat-ing two separate
-    (sink, window) pieces: this Triton version's tl.cat doesn't guarantee
-    element order unless can_reorder=True, and even then there's no
-    guarantee the idx and valid concatenations reorder identically — a real
-    risk of idx[i]/valid[i] silently corresponding to different slots. One
-    shared `slot` index avoids that risk entirely rather than papering over it.
     """
     slot = tl.arange(0, PADDED_KV)
     in_bounds = slot < (SINK + WINDOW)
     is_sink = slot < SINK
-    sink_pos = slot
-    window_pos = (seq_len - WINDOW) + (slot - SINK)
 
-    idx_raw = tl.where(is_sink, sink_pos, window_pos)
-    idx = tl.where(in_bounds, idx_raw, 0)
-    valid = in_bounds & tl.where(is_sink, sink_pos < seq_len, window_pos >= SINK)
+    # Logical position this physical slot currently holds — used only to
+    # decide validity below, never returned as an address.
+    window_logical_pos = (seq_len - WINDOW) + (slot - SINK)
 
-    return idx, valid
+    sink_valid = slot < seq_len
+    window_valid = window_logical_pos >= SINK
+    valid = in_bounds & tl.where(is_sink, sink_valid, window_valid)
+
+    addr_slot = tl.where(in_bounds, slot, 0)
+
+    return addr_slot, valid
 
 
 @triton.jit
 def _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD: tl.constexpr, idx_in_batch, kv_head_idx,
                   window: tl.constexpr, sink: tl.constexpr, N_KV_HEADS: tl.constexpr):
     """Load a KV tile at these cache slots, from a [BATCH, N_KV_HEADS,
-    SINK+WINDOW, D_HEAD] cache. `valid` marks which slots are real (see
-    _kv_indices) — masked at load time (not just in the softmax weights),
-    since invalid window slots can be negative addresses during the ramp-up
-    transient and must never actually be read."""
+    SINK+WINDOW, D_HEAD] cache. `slot_idx` is a physical cache offset (see
+    _kv_indices), always a valid address — but `valid` still has to gate the
+    load itself (not just the softmax weights), since during the ramp-up
+    transient some physical slots haven't been populated with a real token
+    yet; their address is safe to compute, their content isn't safe to use."""
     d_idx = tl.arange(0, D_HEAD)
     seq_len_kv = window + sink
     offset = (idx_in_batch * N_KV_HEADS * seq_len_kv * D_HEAD) + (kv_head_idx * seq_len_kv * D_HEAD + slot_idx * D_HEAD)
