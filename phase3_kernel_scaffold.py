@@ -32,11 +32,19 @@ WINDOW_SIZES = [0, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 
 
 @triton.jit
-def _kv_indices(seq_len, WINDOW: tl.constexpr, SINK: tl.constexpr):
+def _kv_indices(seq_len, WINDOW: tl.constexpr, SINK: tl.constexpr, PADDED_KV: tl.constexpr):
     """Cache-slot indices this query attends to, plus a validity mask.
 
-    Fixed size (SINK+WINDOW) since Triton needs a static shape — ramp-up
-    (seq_len <= SINK+WINDOW, nothing evicted yet) is handled by masking:
+    tl.arange requires a power-of-2 range, but SINK+WINDOW usually isn't one
+    (e.g. 4+256=260) — so the array is padded up to PADDED_KV (the caller's
+    job: next_pow2(SINK+WINDOW)) and the padding lanes are masked invalid,
+    same mechanism as the ramp-up masking below, not a separate special case.
+    Padding lanes get idx clamped to 0 (always a real, in-bounds slot) rather
+    than left as whatever the raw arithmetic produces, so a masked-off lane's
+    *address* is still safe even though its value is discarded.
+
+    Real (non-padding) size (SINK+WINDOW): ramp-up (seq_len <= SINK+WINDOW,
+    nothing evicted yet) is handled by masking:
       - sink slots invalid once >= seq_len (not generated yet)
       - window slots invalid if < SINK (already covered by the sink block —
         avoids double-counting before the window's grown past it)
@@ -49,13 +57,15 @@ def _kv_indices(seq_len, WINDOW: tl.constexpr, SINK: tl.constexpr):
     risk of idx[i]/valid[i] silently corresponding to different slots. One
     shared `slot` index avoids that risk entirely rather than papering over it.
     """
-    slot = tl.arange(0, SINK + WINDOW)
+    slot = tl.arange(0, PADDED_KV)
+    in_bounds = slot < (SINK + WINDOW)
     is_sink = slot < SINK
     sink_pos = slot
     window_pos = (seq_len - WINDOW) + (slot - SINK)
 
-    idx = tl.where(is_sink, sink_pos, window_pos)
-    valid = tl.where(is_sink, sink_pos < seq_len, window_pos >= SINK)
+    idx_raw = tl.where(is_sink, sink_pos, window_pos)
+    idx = tl.where(in_bounds, idx_raw, 0)
+    valid = in_bounds & tl.where(is_sink, sink_pos < seq_len, window_pos >= SINK)
 
     return idx, valid
 
@@ -74,7 +84,7 @@ def _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD: tl.constexp
 
     k = tl.load(K_cache_ptr + offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0)
 
-    # slot_idx: (SINK+WINDOW,) -> (SINK+WINDOW, D_HEAD), one address per
+    # slot_idx: (PADDED_KV,) -> (PADDED_KV, D_HEAD), one address per
     # (slot, head-dim element) pair, matching the tile shape v needs to be.
     v = tl.load(V_cache_ptr + offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0)
 
@@ -85,7 +95,7 @@ def _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD: tl.constexp
 def _sparse_decode_attn_kernel(
     Q_ptr, K_cache_ptr, V_cache_ptr, O_ptr,
     seq_len, sm_scale,
-    WINDOW: tl.constexpr, SINK: tl.constexpr,
+    WINDOW: tl.constexpr, SINK: tl.constexpr, PADDED_KV: tl.constexpr,
     D_HEAD: tl.constexpr, GQA_GROUP: tl.constexpr,
     N_HEADS: tl.constexpr, N_KV_HEADS: tl.constexpr,
 ):
@@ -108,7 +118,7 @@ def _sparse_decode_attn_kernel(
     # over BLOCK_N-sized chunks of (idx, valid), with the running m_i/l_i
     # accumulation the dense tutorial kernel uses, rather than one big block.
     # Worth coming back to once this version is verified correct.
-    slot_idx, valid = _kv_indices(seq_len, WINDOW, SINK)
+    slot_idx, valid = _kv_indices(seq_len, WINDOW, SINK, PADDED_KV)
     k, v = _load_kv_tile(K_cache_ptr, V_cache_ptr, slot_idx, valid, D_HEAD, pid_batch, kv_head, WINDOW, SINK, N_KV_HEADS)
 
     qk = tl.sum(q[None, :] * k, axis=1) * sm_scale
@@ -130,10 +140,13 @@ def sparse_decode_attention(q, k_cache, v_cache, seq_len, window, sink=SINK_SIZE
     if sm_scale is None:
         sm_scale = D_HEAD**-0.5
     grid = (BATCH, N_HEADS)
+    # tl.arange needs a power-of-2 range; SINK+WINDOW usually isn't one, so
+    # round up (padding lanes are masked invalid inside _kv_indices).
+    padded_kv = 1 << (window + sink - 1).bit_length()
     _sparse_decode_attn_kernel[grid](
         q, k_cache, v_cache, o,
         seq_len, sm_scale,
-        WINDOW=window, SINK=sink,
+        WINDOW=window, SINK=sink, PADDED_KV=padded_kv,
         D_HEAD=D_HEAD, GQA_GROUP=GQA_GROUP,
         N_HEADS=N_HEADS, N_KV_HEADS=N_KV_HEADS,
     )
