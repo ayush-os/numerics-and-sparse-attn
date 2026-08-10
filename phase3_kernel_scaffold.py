@@ -130,3 +130,62 @@ def sparse_decode_attention(q, k_cache, v_cache, seq_len, window, sink=SINK_SIZE
         D_HEAD=D_HEAD, GQA_GROUP=GQA_GROUP,
     )
     return o
+
+
+def benchmark():
+    # (b) dense baseline — dense_decode_reference.py, real GQA, no broadcast hack needed.
+    from dense_decode_reference import dense_decode_attention
+    sm_scale = D_HEAD**-0.5
+    device = "cuda"
+
+    results = []
+    for L in CONTEXT_LENGTHS:
+        for W in WINDOW_SIZES:
+            q = torch.randn(BATCH, N_HEADS, D_HEAD, dtype=torch.float16, device=device)
+            k_cache = torch.randn(BATCH, N_KV_HEADS, SINK_SIZE + W, D_HEAD, dtype=torch.float16, device=device)
+            v_cache = torch.randn(BATCH, N_KV_HEADS, SINK_SIZE + W, D_HEAD, dtype=torch.float16, device=device)
+
+            ms_sparse = triton.testing.do_bench(
+                lambda: sparse_decode_attention(q, k_cache, v_cache, seq_len=L, window=W)
+            )
+
+            k_dense = torch.randn(BATCH, N_KV_HEADS, L, D_HEAD, dtype=torch.float16, device=device)
+            v_dense = torch.randn(BATCH, N_KV_HEADS, L, D_HEAD, dtype=torch.float16, device=device)
+            ms_dense = triton.testing.do_bench(
+                lambda: dense_decode_attention(q, k_dense, v_dense, seq_len=L, sm_scale=sm_scale)
+            )
+
+            # Predicted bytes at this stage's actual precision (fp16 Q/O + fp16
+            # K/V, not notes.md's original int8 assumption — see B_FIXED_FP16/
+            # C_FP16 derivation in the conversation, not re-derived here).
+            # Dense substitutes L directly for (W+S), per Phase 1's own dense
+            # sanity check (W+4=L recovers the dense case exactly).
+            B_FIXED_FP16 = 1_048_576
+            C_FP16 = 131_072
+            bytes_sparse_pred = B_FIXED_FP16 + C_FP16 * (W + SINK_SIZE)
+            bytes_dense_pred = B_FIXED_FP16 + C_FP16 * L
+
+            # Memory-bound regime (Phase 1 Finding #3: AI never clears ridge),
+            # so bytes ratio — not FLOPs ratio — is the right proxy for the
+            # wall-clock ratio, matching Phase 2's own "sparsity-alone"
+            # methodology (bytes ratios, not FLOPs ratios).
+            predicted_ratio = bytes_dense_pred / bytes_sparse_pred
+            measured_ratio = ms_dense / ms_sparse
+            gap_pct = 100 * (measured_ratio - predicted_ratio) / predicted_ratio
+
+            # Gap-hunting *why* gap_pct is nonzero is the actual Phase 3/4
+            # content (kernel launch overhead, the still-untiled single-block
+            # sparse kernel, boundary masking, etc.) — not resolved here.
+            results.append({
+                "L": L, "W": W,
+                "ms_sparse": ms_sparse, "ms_dense": ms_dense,
+                "measured_ratio": measured_ratio,
+                "predicted_ratio": predicted_ratio,
+                "gap_pct": gap_pct,
+            })
+
+    return results
+
+
+if __name__ == "__main__":
+    benchmark()
