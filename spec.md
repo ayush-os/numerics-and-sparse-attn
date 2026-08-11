@@ -238,6 +238,18 @@ generator with representability limits.
   theirs closely enough to be a fair comparison) is closest to your
   mechanism — same three-way check disagg's Phase 4 ran against
   DistServe/Mooncake.
+  **(c) explicitly descoped mid-Phase-3** — spec is a starting point, not a
+  contract, per this project's own stated framing. (a) and (b) were both
+  completed and gap-hunted on real hardware; (c) would either mean standing
+  up a real system (vLLM) mostly for integration/systems-slog, not
+  conceptual learning — the same reasoning that already ruled out forking
+  vLLM's kernel earlier in Phase 3 — or a shallow literature box-check
+  against a paper's reported numbers. Neither was judged worth the time
+  against building the KIVI quant layer instead, which has two concrete
+  payoffs (c) doesn't: a genuinely new Triton skill (2-bit packing, no
+  native sub-byte dtype) and real hardware evidence for Phase 2's headline
+  finding (precision's marginal multiplier collapsing from ~3.81× to
+  ~1.59× once layered on sparsity). Full reasoning in `notes.md`.
 - **Gap-hunt every disagreement mechanistically** — the throughline across
   all four prior projects, restated because it's the actual point of this
   phase, not a formality.
