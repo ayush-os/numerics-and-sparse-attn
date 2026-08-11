@@ -623,6 +623,69 @@ roofline ridge — matches Phase 2's own "sparsity-alone" ratio methodology.
    regardless of `L` (consistent with a pure launch-overhead floor, since real work at
    `W=0` is negligible) is a flagged candidate for part of the story, not confirmed.
 
+4. **Investigated further, then deliberately deprioritized (not resolved, not
+   abandoned-by-oversight — a stated call)**: computed achieved bandwidth for the dense
+   kernel (`bytes_dense_pred(L) / ms_dense`, averaged across the 11 `W`-rows per `L`
+   since dense doesn't depend on `W`):
+   ```
+   L         achieved GB/s
+   8,192      323.7
+   16,384     288.7
+   32,768     258.5
+   65,536     241.1
+   131,072    232.5
+   163,840    228.5
+   ```
+   Two real observations: (i) achieved bandwidth is only ~15-20% of an A100's peak HBM
+   bandwidth (~1.5-2 TB/s) even at its best; (ii) it declines monotonically, ~29% from
+   smallest to largest `L`. Two candidate explanations put forward (not verified with
+   profiling):
+   - **Low absolute ceiling**: `dense_decode_reference.py` was explicitly built for
+     correctness, not performance — no autotuning, no explicit `num_warps`/`num_stages`,
+     unlike the real kernels read earlier (the Triton tutorial's autotuned configs,
+     vLLM's tuning machinery). This is high-confidence — a direct, expected consequence
+     of an already-stated design choice, not a new mystery.
+   - **Declining-with-L trend**: hypothesized as GQA cache-reuse fading out. Each
+     `(batch, kv_head)` group's K/V is read redundantly by `GQA_GROUP=8` sibling
+     query-head programs; at small `L` that working set (~4MB at L=8,192) fits
+     comfortably in the A100's 40MB L2 cache, letting sibling reads hit cache instead of
+     HBM and inflating measured "achieved GB/s" above what real HBM traffic would give;
+     by `L=163,840` a single `(batch,kv_head)`'s K tensor alone is ~40MB (the *entire*
+     L2 cache), so the caching benefit disappears and the numbers converge toward the
+     kernel's real, still-untuned ceiling. Mechanistically plausible (the 40MB crossover
+     landing inside the sweep's own range is suggestive) but genuinely unconfirmed — no
+     L2 hit-rate profiling was done. **User judged this not worth pursuing further** —
+     explicit scope call, not an oversight — in favor of moving to the KIVI quant layer.
+
+## Scope decision — comparison target (c) descoped
+
+Per spec.md Phase 3, "compare against three things": (a) hand-derived predictions —
+done, gap-hunted above. (b) dense baseline — done, gap-hunted above. (c) a published
+reference system (vLLM sliding window, StreamingLLM's own numbers, or ASA's ~50%
+figure) — **explicitly decided against**, not attempted.
+
+Reasoning: the user asked directly whether (c) and the KIVI quant layer were worth the
+remaining time in terms of learning, given the project doesn't have to follow spec.md
+verbatim. Assessment given and accepted:
+- **KIVI quant layer**: two concrete, distinct payoffs — 2-bit packing/unpacking is a
+  genuinely new skill (Triton has no native sub-byte dtype), and it's the only way to
+  get real hardware evidence for Phase 2's headline finding (precision's marginal
+  multiplier collapsing from ~3.81× to ~1.59× once layered on sparsity). Worth doing.
+- **Comparison target (c)**: two possible versions, neither compelling. Standing up a
+  real system (e.g. actually running vLLM's sliding-window path) is mostly
+  integration/systems work, not conceptual learning — the same reasoning that already
+  ruled out forking vLLM's kernel earlier in Phase 3 (too much unfamiliar surface area
+  to verify without deep investment). Checking against published numbers from a paper
+  is cheap but shallow — a box-check, not a learning experience. Given the project
+  explicitly doesn't need spec-completeness for its own sake, not worth the time either
+  way.
+
+**Consequence**: Phase 3's comparison is (a) and (b) only, both completed and
+gap-hunted on real hardware. `spec.md` annotated in place (not rewritten) to record this
+as a stated scope decision, matching this project's own established pattern (Decision 3
+in Phase 0, the MLA-scope calls) of keeping rejected/descoped paths on record rather
+than silently dropping them.
+
 ## Open Threads Carried Forward
 
 - Phase 4's MLA substitution needs an additive indexer-overhead term (DeepSeek's
@@ -631,20 +694,23 @@ roofline ridge — matches Phase 2's own "sparsity-alone" ratio methodology.
   non-independent) — needs the full `Bytes(W,p)` solve with MLA's `c`, from scratch.
 - If Phase 4 wants to compare against disagg's authoritative 830.59 req/s/chip / 5.82:1
   numbers, QKVO needs to be added back in the same way disagg did for dense decode.
-- **Phase 3's gap-hunt is incomplete**: the tiling-boundary sawtooth is confirmed, but
-  whether it fully explains the broader negative→positive `gap_%` trend (finding #2
-  above) or whether there's a separate smooth mechanism underneath it is still open.
-- **Phase 3's KIVI quant layer has not been implemented.** Per the staged plan, this was
-  deliberately deferred until the sparse-only kernel was verified correct and
-  benchmarked — that's now done, so this is the next real chunk of kernel work. Real
-  hardware numbers here will show whether Phase 2's hand-derived residual-dilution
-  effect (precision's marginal multiplier collapsing from ~3.81× to ~1.59× once layered
-  on sparsity) is the whole story or whether real kernel overhead (dequant cost,
-  non-contiguous residual/main-buffer access, 2-bit packing/unpacking — Triton has no
-  native sub-byte dtype, so this needs bit-packing 4 values/uint8 and unpacking in-kernel)
-  adds more on top. Live "real vs. predicted gap" candidate.
-- **Comparison target (c) — a published reference system — hasn't been started.**
-  spec.md named vLLM sliding window, StreamingLLM's own numbers, or ASA's ~50% figure as
-  candidates.
+- **Phase 3's gap-hunt is closed out, not fully solved.** Tiling-boundary sawtooth:
+  confirmed. Broader negative→positive `gap_%` trend: a plausible mechanism (GQA
+  cache-reuse fading with L2 cache capacity) identified but not profiled/confirmed, and
+  the user explicitly chose not to pursue it further — a stated scope call, not an
+  abandoned thread. Don't re-open without a specific reason to.
+- **Phase 3's KIVI quant layer has not been implemented — this is the actual next
+  step, start here.** Per the staged plan, deliberately deferred until the sparse-only
+  kernel was verified correct and benchmarked — that's now done. Real hardware numbers
+  here will show whether Phase 2's hand-derived residual-dilution effect (precision's
+  marginal multiplier collapsing from ~3.81× to ~1.59× once layered on sparsity) is the
+  whole story or whether real kernel overhead (dequant cost, non-contiguous
+  residual/main-buffer access, 2-bit packing/unpacking — Triton has no native sub-byte
+  dtype, so this needs bit-packing 4 values/uint8 and unpacking in-kernel) adds more on
+  top. Live "real vs. predicted gap" candidate.
+- **Comparison target (c) — explicitly descoped**, see the scope-decision section
+  above. Not an open thread; don't re-pick this up without a specific reason to revisit
+  the decision.
 - `benchmark_results.csv` (the full 66-point sweep) exists only on the remote GPU
-  instance, not yet copied into the repo.
+  instance, not yet copied into the repo — confirm that instance is still up before the
+  data is lost for good.
