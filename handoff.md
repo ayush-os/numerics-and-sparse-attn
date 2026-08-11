@@ -1,10 +1,16 @@
-# Handoff — numerics-and-sparse-attn, mid-Phase 3
+# Handoff — numerics-and-sparse-attn, starting the KIVI quant layer
 
 Read this + `notes.md` (full narrative log, including the complete Phase 3 bug list and
-gap-hunt) + `spec.md` (the project brief) to pick up exactly where the last session left
-off. Everything below is settled unless explicitly marked open. **The sparse kernel is
-built, correctness-verified, and benchmarked on real hardware (A100). Next real chunk of
-work is finishing the gap-hunt and/or building the KIVI quant layer.**
+gap-hunt) + `spec.md` (the project brief, `spec.md`'s Phase 3 section has an inline note
+on why comparison target (c) was descoped) to pick up exactly where the last session
+left off. Everything below is settled unless explicitly marked open.
+
+**Status: the sparse kernel is built, correctness-verified, and benchmarked on real
+hardware (A100). Gap-hunt is closed out (not fully solved, a deliberate stopping point —
+see below). Comparison target (c) is explicitly descoped, not just skipped. The single
+next action is building the KIVI quant layer (2-bit main + int8 residual, ~128 tokens)
+on top of the now-verified sparse kernel — jump straight to "Next: KIVI quant layer"
+below.**
 
 ## How this project works (read this first)
 
@@ -140,39 +146,78 @@ several are genuinely reusable Triton lessons, not one-offs:
    cache-compaction that's the whole point of the mechanism buys this safety margin,
    not luck.
 
-**Benchmark gap-hunt — in progress, not resolved:**
+**Benchmark gap-hunt — closed out, not fully solved (a deliberate stopping point):**
 - Dense-recovery sanity check (W≈L cases) passes clean on real hardware: gap_% ≈0.5-1.3%.
 - Large systematic pattern in `gap_%`: strongly negative (formula overpredicts speedup)
   at small W, positive (underpredicts) at large W, crossover W shrinking as L grows.
 - **Confirmed sub-mechanism**: `BLOCK_N=128` tiling creates a sawtooth in `gap_%`,
   empirically verified via a targeted `W=124/125/128/256` test (a 1-unit change from
   W=124→125 caused a +66% wall-clock jump — pure tile-count-boundary effect, not real
-  work). Full mechanism and reasoning in notes.md.
-- **Open**: whether this tiling artifact is the whole story behind the broader trend, or
-  whether there's an additional smooth component (launch-overhead amortization,
-  achieved-bandwidth differences) underneath it once the sawtooth is controlled for.
+  work; W=124 is the last point still inside the 1-tile band, W=125 is already just
+  past the boundary into the 2-tile band, same band W=128 sits in — not "125 old tile,
+  128 new tile," both 125 and 128 are on the same side of the actual crossing). Full
+  mechanism in notes.md.
+- **Investigated further, then deliberately deprioritized** (user's explicit call, not
+  an oversight): computed achieved dense-kernel bandwidth per `L` — drops ~29%
+  (323.7→228.5 GB/s) from `L=8,192` to `L=163,840`, and sits at only ~15-20% of A100
+  peak even at best. Two candidate explanations (full detail in notes.md): the low
+  absolute ceiling is high-confidence (kernel was never perf-tuned — no autotuning, no
+  explicit num_warps/num_stages); the declining-with-L trend has a plausible but
+  unconfirmed hypothesis (GQA cache-reuse fading as the working set outgrows the A100's
+  40MB L2 cache). **Don't re-open this without a specific reason to** — it was a
+  considered stop, not an abandoned thread.
 
-## Next: pick up here
+## Comparison target (c) — explicitly descoped, don't re-pick-up without a reason
 
-No single blocking item — these are parallel, pick based on priority:
+Per spec.md Phase 3, three comparisons were named: (a) hand-derived predictions — done.
+(b) dense baseline — done. (c) a published reference system — **decided against**, not
+attempted, not merely deferred. Reasoning (full version in notes.md): the user asked
+directly whether (c) and the KIVI quant layer were worth the remaining time in terms of
+learning, given the project doesn't need spec-completeness for its own sake. KIVI has
+two concrete payoffs (new skill: 2-bit packing; real evidence for Phase 2's headline
+finding); (c) would be either systems-integration slog (standing up vLLM for real,
+same cost/low-payoff reasoning that already ruled out forking vLLM's kernel earlier) or
+a shallow literature box-check. Not worth it either way. `spec.md` itself has an inline
+annotation recording this at the Phase 3 (c) bullet.
 
-1. **Finish the gap-hunt** on the existing sweep data (see open question above). Doesn't
-   need the GPU — `benchmark_results.csv` has everything, once it's copied off the
-   remote box.
-2. **Build the KIVI quant layer** (2-bit main + int8 residual, ~128 tokens) on top of
-   the now-verified sparse kernel — Phase 2's landed choice, deliberately deferred until
-   correctness was established. This is genuinely new kernel work (2-bit packing has no
-   native Triton dtype — needs manual bit-packing/unpacking), needs its own staging
-   discussion, and needs the GPU. Its own correctness check should follow the same
-   independent-reference discipline as the sparse/dense kernels — don't let the
-   assistant write the packing/dequant logic itself if it's the object of study, same as
-   `_kv_indices` wasn't.
-3. **Comparison target (c)**: a published reference system (vLLM sliding window,
-   StreamingLLM's own numbers, or ASA's ~50% figure) — not started at all.
-4. Copy `benchmark_results.csv` back from the remote GPU box into the repo if the raw
-   sweep data should be preserved alongside the analysis.
+## Next: KIVI quant layer — start here
+
+The only remaining piece of Phase 3. Phase 2's landed choice: **2-bit main cache + int8
+residual for the most recent ~128 tokens**, not the crossover-derived `p(W)`
+(unrealizable/negative for practical W) and not an idealized uniform-precision cache
+(Phase 2 showed this overstates savings by >2× once the residual is real).
+
+What this needs, concretely:
+- **A real design/staging discussion first** — this is genuinely new kernel work, not
+  an incremental add to the sparse kernel. Real wrinkle to design around: Triton has no
+  native sub-byte dtype, so 2-bit values need manual bit-packing (4 values per uint8)
+  and unpacking (shifts/masks) inside the kernel — decide the packing layout before
+  writing code.
+- **Per-slot precision branching**: within the compacted `SINK+WINDOW` cache, the most
+  recent ~128 tokens stay int8 (uncompressed), the rest are 2-bit. `_load_kv_tile`
+  needs to determine, per slot, which regime applies and dequantize accordingly — this
+  is conceptually adjacent to the ramp-up masking `_kv_indices` already does (a
+  per-slot regime decision), but a new axis (precision, not validity).
+- **KIVI's real grouping** (from Phase 0's reading, notes.md): K quantized per-channel,
+  V quantized per-token, group size 32 — not a uniform scheme, needs scale/zero-point
+  storage per group.
+- **Same given/theirs split as the sparse kernel**: the packing/dequant logic and the
+  per-slot precision-regime decision are the object of study here — same category as
+  `_kv_indices` was, don't have the assistant write that part. Grid/launch mechanics,
+  benchmark harness plumbing, and (if needed) a from-scratch reference kernel with no
+  quantization-scheme content to preserve are fair game to write directly, same as
+  before.
+- **Its own correctness check**, same independent-reference discipline as
+  `test_sparse_correctness.py`/`test_dense_correctness.py` — diff against a reference
+  before trusting any benchmark numbers, and don't let the assistant derive the
+  dequant/packing reference logic itself if it's checking the assistant's own
+  contribution to the kernel.
+- Needs the GPU. Real bugs are near-certain given how many showed up building the
+  sparse kernel (see the 8-item bug list above) — expect a similar iterative
+  hardware-testing cycle, not a clean first pass.
 
 GPU instance status: recommended shutting it down after the last verification
-experiment (the W=124/125 boundary test) — no further GPU work was pending at handoff
-time. A fresh instance (same A100 sizing guidance above) will need provisioning again
-for items 2-4.
+experiment (the W=124/125 boundary test) at the end of the previous session — confirm
+whether it's still up before assuming `benchmark_results.csv` (still only on that box,
+never copied into the repo) is recoverable. A fresh A100 (same sizing guidance above)
+will need provisioning again if it's gone.
