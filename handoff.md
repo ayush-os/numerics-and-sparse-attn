@@ -91,10 +91,19 @@ Full derivations in `notes.md`. Summary:
 - **Phase 2**: sparsity and precision are **not independent multiplicative levers**
   (difference form, not product form — same root cause as Phase 1's bounded AI). KIVI's
   ~128-token residual is ~49% of a W=256 sparse cache (vs. ~1.6% of a dense L=8,192
-  cache) — precision's marginal multiplier on top of sparsity collapses from ~3.81× to
-  ~1.59× once this is accounted for. **Landed choice for Phase 3**: KIVI 2-bit main +
-  int8 residual (~128 tokens), not the crossover-derived `p(W)` (unrealizable) or an
-  idealized uniform-precision cache (overstates savings >2×).
+  cache) — precision's marginal multiplier on top of sparsity collapses once this is
+  accounted for. **Landed choice for Phase 3**: KIVI 2-bit main + **fp16 residual**
+  (~128 tokens), not the crossover-derived `p(W)` (unrealizable) or an idealized
+  uniform-precision cache (overstates savings by >4×).
+  **Corrected post-kernel-build** (`notes.md`'s fp16-baseline addendum, end of Phase 2):
+  Phase 1/2's formulas originally assumed an int8 baseline (from `decode_notes.md`'s
+  reused workload constants), but Phase 3's actual kernels are fp16 throughout — never
+  reconciled until now. Under the corrected fp16 baseline, precision's marginal
+  multiplier collapses from ~7.17× (realistic, dense) to ~1.76× once layered on
+  sparsity (vs. the original int8-baseline finding of ~3.81×→~1.59×) — sharper, and the
+  residual must be fp16, not int8, to match what's actually been built. Full
+  reconciliation of the rest of Phase 1/2's int8-flavored numbers (AI ceiling, crossover)
+  is deliberately deferred to Phase 4, not done — see `notes.md`'s Open Threads.
 
 ## Phase 3 — in progress
 
@@ -182,10 +191,12 @@ annotation recording this at the Phase 3 (c) bullet.
 
 ## Next: KIVI quant layer — start here
 
-The only remaining piece of Phase 3. Phase 2's landed choice: **2-bit main cache + int8
-residual for the most recent ~128 tokens**, not the crossover-derived `p(W)`
+The only remaining piece of Phase 3. Phase 2's landed choice: **2-bit main cache + fp16
+residual for the most recent ~128 tokens** (corrected from an earlier int8-residual call
+that reasoned from a baseline-precision assumption Phase 3's actual fp16 kernels didn't
+match — see `notes.md`'s fp16-baseline addendum), not the crossover-derived `p(W)`
 (unrealizable/negative for practical W) and not an idealized uniform-precision cache
-(Phase 2 showed this overstates savings by >2× once the residual is real).
+(Phase 2 showed this overstates savings by >4× once the residual is real).
 
 What this needs, concretely:
 - **A real design/staging discussion first** — this is genuinely new kernel work, not
@@ -194,7 +205,7 @@ What this needs, concretely:
   and unpacking (shifts/masks) inside the kernel — decide the packing layout before
   writing code.
 - **Per-slot precision branching**: within the compacted `SINK+WINDOW` cache, the most
-  recent ~128 tokens stay int8 (uncompressed), the rest are 2-bit. `_load_kv_tile`
+  recent ~128 tokens stay fp16 (uncompressed), the rest are 2-bit. `_load_kv_tile`
   needs to determine, per slot, which regime applies and dequantize accordingly — this
   is conceptually adjacent to the ramp-up masking `_kv_indices` already does (a
   per-slot regime decision), but a new axis (precision, not validity).

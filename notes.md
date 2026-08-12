@@ -397,6 +397,113 @@ recent ~128 tokens** — not the crossover-derived `p(W)` (which is unrealizable
 for any practical W), and not an idealized uniform-precision cache (which Phase 2 just
 showed overstates savings by >2× once the residual is real).
 
+**[Superseded below — the "int8 residual" call reasoned from an int8-baseline assumption
+that turned out not to match what Phase 3 actually built. See the fp16 addendum
+immediately following this section for the corrected precision to implement.]**
+
+### Addendum — fp16 baseline correction (discovered after Phase 3 kernel build)
+
+**The mismatch, discovered late:** everything above reused `decode_notes.md`'s workload
+constants, which set `precision_act = int8 (1 byte)` for Q/O — carried through every
+formula above (`B_fixed = 524,288`, the int8 residual choice). But Phase 3's actual
+kernels (`dense_decode_reference.py`, `phase3_kernel_scaffold.py`) were built and
+benchmarked entirely in **fp16** (2 bytes) — Q, K, V, O all fp16 — never reconciled back
+against this section's int8 assumption. Exactly the "reused number needs
+re-verification for the new context" trap this project's own spec names — caught here,
+not silently carried forward.
+
+**Scope of the fix, a deliberate choice:** only the numbers that depend on
+`precision_act`/the residual-precision decision are recalculated below — straight
+substitution (`precision_act: 1→2`), nothing new to derive. The AI-ceiling/crossover/
+dominance sections above are left as-is, un-rewritten, flagged rather than silently
+replaced — same discipline as `spec.md`'s in-place (c)-descoping annotation. Fully
+reconciling every downstream Phase 1/2 number is deferred to Phase 4 on purpose, per this
+project's own scope discipline — only what's actually blocking Phase 3's next build step
+(the residual precision decision) gets resolved now.
+
+**General formula, `precision_act` as an explicit variable `p₀`** (Q/O and the
+"normal"/uncompressed KV precision share this value in the baseline case):
+
+```
+AI(W, p₀) = 16(W+4) / [p₀·(W+12)]        [reduces to the original formula at p₀=1]
+```
+
+AI ceiling (W→∞) = `16/p₀` — **8 at fp16** (p₀=2), not 16. Still ~60× below ridge
+(480.5) — conclusion unchanged (sparse AI never clears ridge), just a lower ceiling.
+
+**Crossover solve, corrected:**
+```
+p(W) = 32/961 − 16/(W+4)          [A∞ = 32/961 is unchanged — it cancels out of the
+                                     variable-bytes/FLOPs ratio and doesn't depend on p₀
+                                     at all; only K doubles: K = 8·p₀ = 16 at fp16]
+```
+Critical window `W* = 476.5` (**double** the original 236.25) — sparse crossover now
+requires an even larger window before *any* precision reaches ridge. At `W=256`
+(previously just above critical), `p(256) ≈ −0.0282` — **now negative**: that window
+moved from "barely above critical" to "below critical" purely from the baseline
+correction, not a new derivation.
+
+**Idealized 2×2 factorial, recomputed (L=8,192, W=256):**
+```
+(a) dense,  p=2(fp16) = 1,074,790,400 B   [exactly 2× original — both terms scale w/ p₀]
+(b) sparse, p=2(fp16) =    35,127,296 B   [exactly 2× original, same reason]
+(c) dense,  p=0.25    =   135,266,304 B   [barely moved — only B_fixed changed; the
+                                            2-bit KV term doesn't depend on p₀ at all]
+(d) sparse, p=0.25    =     5,308,416 B   [same reason, barely moved]
+
+sparsity-alone   = a/b = 30.597×   [UNCHANGED — algebraically independent of p₀]
+precision-alone  = a/c ≈  7.946×   [~2× the original 3.988× — (c) barely moved while
+                                     (a) doubled, so this ratio nearly doubles]
+combined         = a/d ≈ 202.47×
+naive product (30.597×7.946) ≈ 243.1×  → naive overstates by ~20.1% (vs ~8.6% at int8 —
+                                          non-independence is a bigger effect now, not
+                                          just a differently-sized one)
+dominance ratio (sparsity/precision) ≈ 3.851×   [down from 7.67× — precision became
+                                                   relatively more valuable]
+```
+At L=163,840: precision-alone → 7.997× (asymptotically approaches `p₀/p_low = 2/0.25=8`
+exactly — the clean large-L limit, matching how the original approached `1/0.25=4`).
+combined ≈ 4,045.6×, dominance ratio ≈ 76.45× (grows ~19.85× from L=8,192→163,840 — same
+~20× L-scaling pattern as before, mechanism unchanged, just the anchor values differ).
+
+**Residual-buffer correction, corrected — the load-bearing result:**
+
+Per the corrected reasoning (residual precision should match *this project's real
+operating point*, and that's now established as fp16, not int8), the residual buffer is
+**fp16 (2 bytes/element)**, not int8. Recomputed with 128 residual tokens at fp16
+(4,096 B/tok) + remainder at 2-bit (512 B/tok), L=8,192, W=256:
+
+```
+c_realistic (dense, mixed)  = 149,946,368 B  (+10.9% vs idealized 135,266,304 — bigger
+                                               residual tax than int8's +4.7%)
+d_realistic (sparse, mixed) =  19,988,480 B  (+276.5% vs idealized 5,308,416 — vs
+                                               int8's +131.5%)
+
+precision-alone realistic = a/c_realistic ≈ 7.168×
+combined realistic        = a/d_realistic ≈ 53.77×
+
+naive product (realistic) = 30.597×7.168 ≈ 219.3×
+actual combined realistic                 ≈  53.77×
+naive overstates by ~308% (predicts >4× the real savings — worse than int8's ~140%)
+
+precision's marginal multiplier once layered on sparsity = 53.77/30.597 ≈ 1.757×
+   (down from precision-alone-realistic's own 7.168× — a 75.5% relative collapse,
+    vs int8's 3.81×→1.59× = 58.2% collapse — same effect, now sharper)
+```
+
+**Why it's sharper, mechanistically:** fp16 residual tokens cost 4,096 B vs. the 2-bit
+main cache's 512 B — an **8× per-token tax** (vs. int8's 4×). The 128-token residual is
+still ~49% of the W=256 cache *by count*, same as before, but now claims **~88.6%** of
+the cache's total bytes (up from ~80% under int8) — the residual dominates the sparse
+cache's byte budget even more completely. Same root mechanism as the original finding
+(uncompressed tokens cost disproportionately more bytes per position), amplified by the
+baseline correction.
+
+**Resolved for Phase 3:** the KV-cache precision to implement is **KIVI 2-bit
+(p=0.25 bytes/element) with an FP16 residual (2 bytes) for the most recent ~128
+tokens** — superseding this section's original "int8 residual" call, which reasoned from
+an assumption (int8 baseline) that didn't match what was actually built.
+
 ---
 
 ## Phase 3 — real Triton kernel
@@ -688,6 +795,12 @@ than silently dropping them.
 
 ## Open Threads Carried Forward
 
+- **Resolved**: the int8/fp16 baseline mismatch between Phase 1/2's formulas and Phase
+  3's actual fp16 kernels — see the "fp16 baseline correction" addendum at the end of
+  Phase 2. Residual precision corrected from int8 to fp16 (2 bytes); AI ceiling, crossover
+  window, and dominance-ratio numbers recalculated for fp16. Full reconciliation of every
+  remaining int8-flavored number elsewhere in Phase 1/2 is *not* done — deliberately
+  deferred to Phase 4, same scope discipline as the MLA/(c) deferrals below.
 - Phase 4's MLA substitution needs an additive indexer-overhead term (DeepSeek's
   published numbers), not a pure `c` swap — flagged in Decision 3, not yet quantified.
   **Sharpened by Phase 2**: also can't shortcut via an AI-ratio multiplier (confirmed
