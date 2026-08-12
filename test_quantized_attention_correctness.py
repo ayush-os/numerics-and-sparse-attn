@@ -22,10 +22,8 @@
 
 import torch
 
-from phase3_kernel_scaffold import (
-    BATCH, N_HEADS, N_KV_HEADS, GQA_GROUP, D_HEAD, SINK_SIZE, RESIDUAL_SIZE, GROUP_SIZE,
-    build_quantized_kv_cache, sparse_decode_attention_quantized,
-)
+from constants import BATCH, N_HEADS, N_KV_HEADS, GQA_GROUP, D_HEAD, SINK_SIZE, RESIDUAL_SIZE, GROUP_SIZE
+from quant_kernel import build_quantized_kv_cache, sparse_decode_attention_quantized
 from test_quantize_correctness import _reference_unpack_dequant
 
 DEVICE = "cuda"

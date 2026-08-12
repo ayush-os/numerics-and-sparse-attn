@@ -1,23 +1,14 @@
 # Correctness check for the KIVI quantize functions (quantize_k_cache,
 # quantize_v_cache) -- comparison target: an independent reference
 # unpack+dequant, written entirely in plain PyTorch. Doesn't reuse
-# _dequantize_tile (doesn't exist yet, and shouldn't be reused even once it
-# does -- an independent check written by the same source as the thing being
-# checked isn't independent, same reasoning as test_sparse_correctness.py's
-# mask sourcing).
-#
-# Requires a real GPU (quantize_k_cache/quantize_v_cache launch actual
-# Triton kernels) -- can't run until you're on hardware, written now so it's
-# ready the moment you are. This also exercises _quantize_k_kernel's and
-# _quantize_v_kernel's own flagged-unverified spots (axis reductions, uint8
-# cast, compile-time tile indexing) for the first time.
+# _dequantize_k_tile/_dequantize_v_tile -- an independent check written by
+# the same source as the thing being checked isn't independent, same
+# reasoning as test_sparse_correctness.py's mask sourcing.
 
 import torch
 
-from phase3_kernel_scaffold import (
-    D_HEAD, SINK_SIZE, GROUP_SIZE, QUANT_BITS,
-    quantize_k_cache, quantize_v_cache,
-)
+from constants import D_HEAD, SINK_SIZE, GROUP_SIZE, QUANT_BITS
+from quant_kernel import quantize_k_cache, quantize_v_cache
 
 DEVICE = "cuda"
 

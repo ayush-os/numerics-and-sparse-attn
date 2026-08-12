@@ -18,11 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
-from phase3_kernel_scaffold import (
-    D_HEAD, GROUP_SIZE, QUANT_BITS,
-    quantize_k_cache, quantize_v_cache,
-    _dequantize_k_tile, _dequantize_v_tile,
-)
+from constants import D_HEAD, GROUP_SIZE, QUANT_BITS
+from quant_kernel import quantize_k_cache, quantize_v_cache, _dequantize_k_tile, _dequantize_v_tile
 from test_quantize_correctness import _reference_unpack_dequant
 
 DEVICE = "cuda"

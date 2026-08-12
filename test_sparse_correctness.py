@@ -1,19 +1,15 @@
-# Correctness check for the sparse sliding-window+sink decode kernel, per the
-# staged plan: verify against a reference before trusting any benchmark
-# numbers. Run this before phase3_kernel_scaffold.py's benchmark().
+# Correctness check for the sparse sliding-window+sink decode kernel
+# (comparison target (a) in benchmark.py). Run before benchmark.py.
 #
-# TODO (yours — same content as _kv_indices, just over the full context
-# instead of the compacted cache): _reference_sparse_attention's mask.
-# Everything else here — the harness, the generic masked-softmax math, the
-# compacted-cache construction, adversarial garbage in masked-out slots — is
-# plumbing, not sparsity-selection logic, so it's filled in.
+# Reference mask sourced from mit-han-lab/streaming-llm's own kv_cache.py
+# (StartRecentKVCache.__call__), not derived from the same reasoning as
+# _kv_indices — an independent check written by the same source as the
+# thing being checked isn't independent.
 
 import torch
 
-from phase3_kernel_scaffold import (
-    BATCH, N_HEADS, N_KV_HEADS, GQA_GROUP, D_HEAD, SINK_SIZE,
-    sparse_decode_attention,
-)
+from constants import BATCH, N_HEADS, N_KV_HEADS, GQA_GROUP, D_HEAD, SINK_SIZE
+from sparse_kernel import sparse_decode_attention
 
 DEVICE = "cuda"
 GARBAGE_VALUE = 1e4  # deliberately large, not random — a masking bug that

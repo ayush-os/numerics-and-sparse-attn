@@ -1,13 +1,11 @@
-# Correctness check for the dense decode reference kernel (comparison
-# target (b)). Never verified against a reference before — only ever
-# smoke-tested for shape/NaN — despite it being what predicted_ratio /
-# measured_ratio in phase3_kernel_scaffold.py's benchmark actually gets
-# compared against. No sparsity-selection content here (dense attention has
-# no masking/validity logic at all), so this whole file is boilerplate.
+# Correctness check for the dense decode kernel (comparison target (b) in
+# benchmark.py). No sparsity-selection content here — dense attention has
+# no masking/validity logic at all — so this whole file is boilerplate.
 
 import torch
 
-from dense_decode_reference import BATCH, N_HEADS, N_KV_HEADS, D_HEAD, dense_decode_attention
+from constants import BATCH, N_HEADS, N_KV_HEADS, D_HEAD
+from dense_kernel import dense_decode_attention
 
 DEVICE = "cuda"
 
