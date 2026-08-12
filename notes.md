@@ -793,6 +793,188 @@ as a stated scope decision, matching this project's own established pattern (Dec
 in Phase 0, the MLA-scope calls) of keeping rejected/descoped paths on record rather
 than silently dropping them.
 
+## Phase 3 continued — KIVI quant layer (2-bit main + fp16 residual)
+
+Picked up from the open thread below: sparse-only kernel was correct and benchmarked,
+quant layer was the deferred next step. Full build, real-hardware debugging, two rounds
+of optimization, and a final benchmark, all in one continuous push. Code now lives in
+`quant_kernel.py` (was `phase3_kernel_scaffold.py`'s second half) — see that file's own
+module-level header for a condensed version of this bug list.
+
+### Design, worked out before any code
+
+- **K is per-channel** (each of the 128 channels gets its own scale/zero-point,
+  computed from that channel's own values), **grouped in chunks of 32 along seq_len**
+  (a channel's token history is chunked into 32-token groups, not one scale for the
+  whole history) — matches KIVI's real scheme (Phase 0 reading) and the empirical
+  reason it exists: K has channels that are consistently large across every token
+  (an outlier-channel pattern), and sharing a scale across channels would let one
+  outlier channel's magnitude dictate the step size for 127 well-behaved channels,
+  crushing their precision. Per-channel isolates that.
+- **V is per-token** (each token gets its own scale, from that token's own 128
+  channels), **grouped in chunks of 32 along D_HEAD** (a token's 128-dim vector splits
+  into 4 groups of 32 channels) — the mirror image, since V doesn't have K's
+  outlier-channel structure; what varies is token-to-token, not channel-to-channel.
+- **Packing**: 4 codes/byte (2-bit × 4 = 8 bits), via shift+OR
+  (`byte = v0 | (v1<<2) | (v2<<4) | (v3<<6)`). Packed-codes tensor shapes mirror-flip
+  between K and V: K keeps `D_HEAD` full-size and shrinks `seq_len` (packed axis =
+  `seq_len/4`, scale axis = `seq_len/32`); V keeps `seq_len` full-size and shrinks
+  `D_HEAD` (packed axis = `D_HEAD/4`, scale axis = `D_HEAD/32`) — a real structural
+  asymmetry, not a coincidence of which axis got divided.
+- **Affine quantization formula**: `scale = (max-min)/QMAX`, `zero_point =
+  round(qmin - min/scale)`, quantize `q = clamp(round(x/scale)+zero_point, 0, QMAX)`,
+  dequantize `x_hat = scale*(q-zero_point)`. Zero-point doesn't need to fall inside
+  `[0, QMAX]` itself — it's just a shift constant, usually far outside that range
+  since K/V data is rarely centered near zero.
+- **Residual/sink/window-old split**: the compacted `[SINK+WINDOW]` cache splits into
+  three regimes by physical slot — sink (`[0, SINK)`, always quantized), window-old
+  (the older part of the window, quantized), and residual (the most recent
+  `RESIDUAL_SIZE=128` tokens, i.e. the *last* slots of the window — never quantized,
+  stays fp16). Getting "most recent" right required using slot-index direction, not
+  ambiguous language: window slots are laid out oldest-to-newest as slot index
+  increases (per `_kv_indices`'s own convention), so residual is the *highest* slot
+  indices, not intuitively "the front" or "the back" of anything.
+- **Sink padding**: `quantize_k_cache`/`quantize_v_cache` assume `seq_len` is a clean
+  multiple of `GROUP_SIZE=32`. `SINK+WINDOW-RESIDUAL_SIZE` (the "main"/quantized
+  region's natural size) is *never* a multiple of 32 for any `WINDOW` in the sweep —
+  always off by exactly `SINK=4`, since `WINDOW` and `RESIDUAL_SIZE` are both
+  multiples of 32 and only `SINK` isn't. Resolved by quantizing sink and window-old
+  *separately* (window-old alone is always a clean multiple of 32, no fix needed
+  there), and padding sink's 4 real tokens up to one full group of 32 by *repeating
+  its own first real token* — not zeros or garbage — so the padding doesn't stretch
+  the group's min/max range and dilute precision on the 4 real values.
+- **Metadata precision**: scale/zero-point stored fp16, not fp32. At `GROUP_SIZE=32`,
+  fp32 metadata makes the *real* effective cost `0.5 bytes/element` (vs. the
+  codes-only `0.25` Phase 2 used); fp16 metadata brings it to `0.375`. fp16 chosen
+  since fp16's precision on the scale itself isn't the bottleneck — the 2-bit code
+  resolution already dominates the error — and it halves a real, non-trivial overhead
+  Phase 2's original formula never accounted for at all (flagged, not retroactively
+  fixed in Phase 2's own numbers).
+
+### Real bugs found only by running on hardware, in order
+
+1. **Triton version mismatch.** The environment's pip-installed torch bundled Triton
+   2.1.0, much older than what these kernels needed — `tl.range` doesn't exist in it
+   (`AttributeError: module 'triton.language' has no attribute 'range'`), and its
+   `@triton.jit` decorator's constexpr-detection internals broke on this Python/Triton
+   combination in an unrelated way (`TypeError: argument of type 'dtype' is not
+   iterable`) even on the *already-verified* dense kernel. Fixed with `pip install -U
+   triton`, independent of torch's bundled version.
+2. **`tl.math.round` doesn't exist on this Triton version** (`tl.math.exp` does, so
+   it's specifically `round` that's missing). Replaced with `tl.floor(x + 0.5)`, a
+   portable round-half-up substitute — exact `.5`-boundary tie-breaking differs
+   slightly from Python's round-half-to-even, a sub-LSB-scale difference not worth
+   chasing.
+3. **Unsupported tensor row/column indexing.** `q[b*PACK_FACTOR+j, :]` — indexing a
+   specific row out of an already-computed 2D tile with a non-Python-int index
+   (`b`,`j` came from unrolled loops but still lowered to a runtime-typed index) isn't
+   supported on this Triton version (`unsupported tensor index: int32[]`). This was
+   flagged as an explicit unverified risk before ever running. Fixed by never
+   materializing one big quantized tensor and slicing it — instead, compute each of
+   the `PACK_FACTOR` packing positions via a *fresh*, independently strided load, and
+   combine with plain elementwise ops. Same fix applied to K (row) and V (column,
+   mirror image).
+4. **Loop-carried dtype widening.** A `uint8` accumulator (`packed`) built inside a
+   loop via `|=`/`<<` gets silently widened to `int32` by Triton's type promotion
+   rules — but a loop-carried variable's declared type has to stay fixed across
+   iterations (`Loop-carried variable packed has initial type uint8 but is
+   re-assigned to int32`). Fixed by declaring the accumulator `int32` from the start
+   and casting down to `uint8` once, at the store, not every iteration.
+5. **A dtype mismatch in `_load_kv_tile_quantized`'s `tl.where`** (residual load
+   stayed native fp16 while the dequantized sink/window branches were fp32) was
+   hypothesized as the cause of `test_quantized_attention_correctness.py`'s first
+   failure — **wrong hypothesis**, fixing it produced bit-identical results before and
+   after, meaning Triton's `tl.where` was already promoting correctly. Real,
+   legitimate improvement to make regardless (explicit is better than relying on
+   implicit promotion), just not the bug in question — a useful negative result that
+   narrowed the search.
+6. **The real bug behind that failure: a tile-level clamp corrupted real, in-range
+   data.** `win_tok_start = tl.maximum(slot_start - sink, 0)` was meant to keep
+   addressing safe, but clamping the *shared, tile-level* starting offset broke the
+   `tok_start + tok_in_tile` relationship for *every* position in the first tile, not
+   just the genuinely invalid ones — shifting every real window-old position in that
+   tile forward by exactly `sink` (4) tokens, which happens to equal `PACK_FACTOR`, so
+   every one of them silently read the *adjacent* packed byte instead of its own.
+   Symptom matched the mechanism exactly: real-looking-but-wrong-position data (not
+   garbage), and `max_abs_diff` shrinking as `WINDOW` grew, since the bug was confined
+   to one fixed-size tile whose share of the total output shrinks as the cache grows.
+   Root-caused via `test_dequantize_tile_isolated.py` (a new test, written specifically
+   to bypass `_load_kv_tile_quantized`'s composition and test `_dequantize_k_tile`/
+   `_dequantize_v_tile` alone) coming back bit-perfect — that isolated the bug to the
+   composition logic, not the dequant math itself. Fixed by *not* clamping the shared
+   tile-level offset — letting it go negative — and instead clamping the per-position
+   computed index, inside the dequant functions, which already had an upper-bound
+   clamp and just needed a lower-bound one added.
+
+### Optimization: two rounds, one failed, one worked
+
+First benchmark (correct, but naive): `_load_kv_tile_quantized` computes all three
+regime candidates (sink dequant, window-old dequant, residual load) unconditionally,
+every tile, then selects via `tl.where` ("compute broadly, select narrowly" —
+deliberate, for correctness/safety). Since `SINK=4` is tiny relative to `BLOCK_N=128`,
+only the very first tile can ever contain a real sink position, yet every tile paid
+for a full, wasted sink dequant; residual similarly wasted on tiles that are purely
+sink+window-old. Measured: quantized kernel **slower than native sparse everywhere**
+(`meas_mult` as low as 0.017–0.018 at large `WINDOW`, vs. a predicted ~5×) — the
+opposite of the whole point of quantizing.
+
+**Attempt 1 (failed): runtime `if`/`else`.** Guard each candidate's expensive
+load/dequant behind `if slot_start < <regime boundary>:`, falling back to a
+zero-filled placeholder otherwise (both branches must define the same variables with
+matching types, same discipline as the loop-carried-dtype fix). Measured **~20x
+slower**, not faster. Best-guess mechanism (unconfirmed without profiling access):
+Triton's scalar `if`/`else` likely doesn't skip real work the way normal Python
+control flow implies — plausibly predicated/masked execution under the hood — plus it
+may break the loop pipelining tight GPU loops depend on. **Reverted.**
+
+**Attempt 2 (worked): split the loop itself at compile time.** `sink`, `WIN_OLD_END`,
+and `BLOCK_N` are all `tl.constexpr` — known when Triton compiles a given kernel
+variant, not just at runtime. Restructured `_sparse_decode_attn_kernel_quantized`'s
+single loop into three Python-level segments instead: segment 1 (tile 0, always
+present, using the general 3-regime `_load_kv_tile_quantized`, since it's the only
+tile that can ever mix regimes), segment 2 (the middle stretch, provably pure
+window-old, using a new, genuinely branch-free `_load_kv_tile_window_old` — no
+sink/residual code even exists in that loop body, not skipped, never generated), and
+segment 3 (the window-old/residual boundary + pure residual tail, back to the general
+helper). `WIN_OLD_END mod BLOCK_N` turns out to always equal exactly `SINK` for every
+`WINDOW` in the sweep (since `WINDOW` and `RESIDUAL_SIZE` are both multiples of
+`BLOCK_N`), so segments 1 and 3 stay fixed at ~1-2 tiles regardless of `WINDOW` — only
+segment 2 scales, which is exactly the segment kept branch-free. This worked: measured
+multiplier roughly doubled-to-tripled across the sweep (e.g. `W=16384`: ~0.33-0.39 →
+~0.72; `W=128`: ~0.68 → ~0.96-0.97, essentially matching the 0.986 prediction).
+
+### Final benchmark results (results/benchmark_results_quantized.csv)
+
+- **Quantized-sparse vs. native sparse**: still slower everywhere (`meas_mult` never
+  crosses 1.0), but no longer catastrophically so — from ~0.43× to ~0.97× depending on
+  `WINDOW`, closest to break-even at `WINDOW=128`.
+- **Quantized-sparse vs. dense**: faster for most of the sweep (e.g. `L=163840,
+  W=16384`: dense≈90.5ms, quantized≈9.5ms, ~9.5× faster) — but *loses* to dense
+  whenever `WINDOW` approaches `L` (e.g. `L=8192, W=8192`: dense=3.25ms,
+  quantized=5.97ms). Makes sense mechanistically: at `W≈L` there's no real sparsity
+  savings left to offset quantization/dequant overhead, so you're paying the tax with
+  nothing to show for it. Not a bug — the honest boundary of where this combination
+  actually helps.
+- **Remaining gap has a plausible, understood, unchased mechanism**: `_dequantize_k_tile`/
+  `_dequantize_v_tile` load scale/zero-point at full `(BLOCK_N, D_HEAD)` resolution even
+  though they only vary once every `GROUP_SIZE=32` tokens — real redundant HBM traffic
+  that scales with how much of the cache is window-old, matching the gap widening again
+  at larger `WINDOW`. Same shape of decision as the dense kernel's own achieved-bandwidth
+  question earlier in Phase 3: understood, real, explicitly not chased further —
+  diminishing returns after two optimization rounds, with Phase 4 being clearly
+  higher-value unexplored territory at this point.
+
+### Correctness tests, in the order they were built
+
+`test_quantize_correctness.py` (write-side: `quantize_k_cache`/`quantize_v_cache`
+round-trip against a from-scratch plain-PyTorch reference, including the sink-padding
+boundary case) → `test_dequantize_tile_isolated.py` (read-side alone, bypassing
+`_load_kv_tile_quantized`'s composition, written specifically to isolate the tile-clamp
+bug above) → `test_quantized_attention_correctness.py` (the full path, composing
+already-independently-verified reference pieces rather than re-deriving from scratch,
+tight ~1e-2 tolerance since both reference and kernel start from identical
+already-quantized data). All pass.
+
 ## Open Threads Carried Forward
 
 - **Resolved**: the int8/fp16 baseline mismatch between Phase 1/2's formulas and Phase
@@ -807,23 +989,30 @@ than silently dropping them.
   non-independent) — needs the full `Bytes(W,p)` solve with MLA's `c`, from scratch.
 - If Phase 4 wants to compare against disagg's authoritative 830.59 req/s/chip / 5.82:1
   numbers, QKVO needs to be added back in the same way disagg did for dense decode.
-- **Phase 3's gap-hunt is closed out, not fully solved.** Tiling-boundary sawtooth:
-  confirmed. Broader negative→positive `gap_%` trend: a plausible mechanism (GQA
-  cache-reuse fading with L2 cache capacity) identified but not profiled/confirmed, and
-  the user explicitly chose not to pursue it further — a stated scope call, not an
-  abandoned thread. Don't re-open without a specific reason to.
-- **Phase 3's KIVI quant layer has not been implemented — this is the actual next
-  step, start here.** Per the staged plan, deliberately deferred until the sparse-only
-  kernel was verified correct and benchmarked — that's now done. Real hardware numbers
-  here will show whether Phase 2's hand-derived residual-dilution effect (precision's
-  marginal multiplier collapsing from ~3.81× to ~1.59× once layered on sparsity) is the
-  whole story or whether real kernel overhead (dequant cost, non-contiguous
-  residual/main-buffer access, 2-bit packing/unpacking — Triton has no native sub-byte
-  dtype, so this needs bit-packing 4 values/uint8 and unpacking in-kernel) adds more on
-  top. Live "real vs. predicted gap" candidate.
+- **Phase 3's native-kernel gap-hunt is closed out, not fully solved.** Tiling-boundary
+  sawtooth: confirmed. Broader negative→positive `gap_%` trend: a plausible mechanism
+  (GQA cache-reuse fading with L2 cache capacity) identified but not
+  profiled/confirmed, and the user explicitly chose not to pursue it further — a
+  stated scope call, not an abandoned thread. Don't re-open without a specific reason to.
+- **Phase 3 is fully done, including the KIVI quant layer.** Real hardware numbers
+  confirmed Phase 2's hand-derived residual-dilution effect is real but *not* the whole
+  story — a naive kernel implementation (computing all three regimes unconditionally
+  per tile) added its own large, separate real-hardware cost (~3x redundant memory
+  traffic) that the byte-only hand-derivation structurally couldn't see. That cost was
+  mostly (not fully) recovered via a loop-segmentation optimization; the residual gap
+  (redundant scale/zero-point loads, ~62-86% below prediction depending on WINDOW) is
+  understood but deliberately not chased further. Full narrative, all bugs found, and
+  both optimization attempts (one that backfired ~20x, one that worked) are in the
+  "Phase 3 continued — KIVI quant layer" section above.
 - **Comparison target (c) — explicitly descoped**, see the scope-decision section
   above. Not an open thread; don't re-pick this up without a specific reason to revisit
   the decision.
-- `benchmark_results.csv` (the full 66-point sweep) exists only on the remote GPU
-  instance, not yet copied into the repo — confirm that instance is still up before the
-  data is lost for good.
+- **Repo restructured** after Phase 3 closed out: `phase3_kernel_scaffold.py` (1092
+  lines mixing native sparse kernel + full quant layer + benchmark harness) split into
+  `constants.py`, `dense_kernel.py` (renamed from `dense_decode_reference.py`),
+  `sparse_kernel.py`, `quant_kernel.py`, and `benchmark.py`; `triton_fused_attention_
+  tutorial.py` deleted (confirmed unused — the reasoning for why it wasn't forked was
+  already preserved in `dense_kernel.py`'s own header); CSVs moved into `results/`.
+  All 5 test files' imports updated to match. If a file mentioned in an *older* part of
+  this log (e.g. `phase3_kernel_scaffold.py`) doesn't exist anymore, this is why —
+  check the current top-level file layout, not the historical name.
