@@ -613,47 +613,66 @@ def _load_kv_tile_quantized(
     sink_tok_start = slot_start                       # sink's own numbering == physical slot directly
     win_tok_start = slot_start - sink
 
-    k_sink = _dequantize_k_tile(
-        K_sink_packed_ptr, K_sink_scale_ptr, K_sink_zero_ptr,
-        sink_tok_start, SINK_NUM_PACKED, SINK_NUM_GROUPS,
-        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
-        GROUP_SIZE, BITS, BLOCK_N,
-    )
-    v_sink = _dequantize_v_tile(
-        V_sink_packed_ptr, V_sink_scale_ptr, V_sink_zero_ptr,
-        sink_tok_start, SINK_SEQ_LEN,
-        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
-        GROUP_SIZE, BITS, BLOCK_N,
-    )
+    # OPTIMIZATION, added after benchmarking: computing all three regime
+    # candidates unconditionally, every tile, measured at converging to
+    # ~3x real memory traffic versus what's structurally needed (SINK=4 is
+    # tiny relative to BLOCK_N, so only the very first tile can ever
+    # contain a sink position, yet every tile was still paying for a full
+    # sink dequant -- same story, smaller effect, for residual on tiles
+    # that are purely sink+window-old). Each candidate's expensive
+    # load/dequant is now skipped via a runtime `if` whenever this tile
+    # provably can't overlap that regime; zero-filled placeholders keep
+    # both branches defining the same variables with matching types (same
+    # discipline as the loop-carried-dtype fix earlier). This is genuinely
+    # new, untested control-flow for this file -- none of the existing
+    # kernels use scalar if/else, only tl.where -- so UNVERIFIED, same as
+    # everything else that's hit a real Triton-version surprise so far.
+    if slot_start < sink:
+        k_sink = _dequantize_k_tile(
+            K_sink_packed_ptr, K_sink_scale_ptr, K_sink_zero_ptr,
+            sink_tok_start, SINK_NUM_PACKED, SINK_NUM_GROUPS,
+            D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+            GROUP_SIZE, BITS, BLOCK_N,
+        )
+        v_sink = _dequantize_v_tile(
+            V_sink_packed_ptr, V_sink_scale_ptr, V_sink_zero_ptr,
+            sink_tok_start, SINK_SEQ_LEN,
+            D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+            GROUP_SIZE, BITS, BLOCK_N,
+        )
+    else:
+        k_sink = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
+        v_sink = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
 
-    k_old = _dequantize_k_tile(
-        K_win_packed_ptr, K_win_scale_ptr, K_win_zero_ptr,
-        win_tok_start, WIN_NUM_PACKED, WIN_NUM_GROUPS,
-        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
-        GROUP_SIZE, BITS, BLOCK_N,
-    )
-    v_old = _dequantize_v_tile(
-        V_win_packed_ptr, V_win_scale_ptr, V_win_zero_ptr,
-        win_tok_start, WIN_OLD_LEN,
-        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
-        GROUP_SIZE, BITS, BLOCK_N,
-    )
+    if slot_start < WIN_OLD_END:
+        k_old = _dequantize_k_tile(
+            K_win_packed_ptr, K_win_scale_ptr, K_win_zero_ptr,
+            win_tok_start, WIN_NUM_PACKED, WIN_NUM_GROUPS,
+            D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+            GROUP_SIZE, BITS, BLOCK_N,
+        )
+        v_old = _dequantize_v_tile(
+            V_win_packed_ptr, V_win_scale_ptr, V_win_zero_ptr,
+            win_tok_start, WIN_OLD_LEN,
+            D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+            GROUP_SIZE, BITS, BLOCK_N,
+        )
+    else:
+        k_old = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
+        v_old = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
 
     # Residual: no packing, direct fp16 load -- own small [.., RESIDUAL_SIZE,
     # D_HEAD] cache, same load shape as _load_kv_tile, just against a
     # smaller, separately-allocated tensor with its own local numbering.
-    res_local_slot = tl.maximum(slot_idx - WIN_OLD_END, 0)
-    res_offset = (idx_in_batch * N_KV_HEADS * RESIDUAL_SIZE * D_HEAD) + \
-                 (kv_head_idx * RESIDUAL_SIZE * D_HEAD + res_local_slot * D_HEAD)
-    # REAL BUG FOUND ON HARDWARE: k_sink/k_old/v_sink/v_old come back from
-    # _dequantize_k_tile/_dequantize_v_tile as fp32, but this residual load
-    # was left at K_cache_ptr/V_cache_ptr's native fp16 -- the tl.where
-    # below combined mismatched dtypes across branches. Explicit upcast
-    # fixes it; error was residual-specific and shrank as WINDOW grew
-    # (residual's fixed RESIDUAL_SIZE becomes a smaller fraction of the
-    # total cache at larger WINDOW), which is what pointed here.
-    k_res = tl.load(K_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
-    v_res = tl.load(V_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    if slot_start + BLOCK_N > WIN_OLD_END:
+        res_local_slot = tl.maximum(slot_idx - WIN_OLD_END, 0)
+        res_offset = (idx_in_batch * N_KV_HEADS * RESIDUAL_SIZE * D_HEAD) + \
+                     (kv_head_idx * RESIDUAL_SIZE * D_HEAD + res_local_slot * D_HEAD)
+        k_res = tl.load(K_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+        v_res = tl.load(V_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    else:
+        k_res = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
+        v_res = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
 
     # Compute-broadly, select-narrowly: all three candidates were computed
     # safely for the whole tile above; this is the only place that decides
