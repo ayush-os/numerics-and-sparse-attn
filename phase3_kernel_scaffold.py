@@ -873,5 +873,117 @@ def _print_and_save(results, path="benchmark_results.csv"):
     print(f"\nSaved {len(results)} rows to {path}")
 
 
+def benchmark_quantized():
+    # Added once the quant-layer kernels were verified correct on hardware
+    # (test_quantize_correctness.py, test_dequantize_tile_isolated.py,
+    # test_quantized_attention_correctness.py all pass). Kept separate from
+    # benchmark() above rather than merged in -- same staged-build reasoning
+    # as building the sparse kernel before layering quant on top, isolates
+    # which numbers come from which code path. Re-times dense/sparse-native
+    # here too (not reused from benchmark()'s own run), for a self-contained,
+    # directly comparable set of measurements in one pass.
+    #
+    # WINDOW < RESIDUAL_SIZE skipped -- build_quantized_kv_cache's own
+    # standing, deliberately-unhandled assumption.
+    from dense_decode_reference import dense_decode_attention
+    sm_scale = D_HEAD**-0.5
+    device = "cuda"
+
+    B_FIXED_FP16 = 1_048_576
+    C_FP16 = 131_072
+
+    results = []
+    windows = [w for w in WINDOW_SIZES if w >= RESIDUAL_SIZE]
+    for L in CONTEXT_LENGTHS:
+        for W in windows:
+            q = torch.randn(BATCH, N_HEADS, D_HEAD, dtype=torch.float16, device=device)
+
+            k_compacted = torch.randn(BATCH, N_KV_HEADS, SINK_SIZE + W, D_HEAD, dtype=torch.float16, device=device)
+            v_compacted = torch.randn(BATCH, N_KV_HEADS, SINK_SIZE + W, D_HEAD, dtype=torch.float16, device=device)
+
+            ms_sparse = triton.testing.do_bench(
+                lambda: sparse_decode_attention(q, k_compacted, v_compacted, seq_len=L, window=W)
+            )
+
+            k_dense = torch.randn(BATCH, N_KV_HEADS, L, D_HEAD, dtype=torch.float16, device=device)
+            v_dense = torch.randn(BATCH, N_KV_HEADS, L, D_HEAD, dtype=torch.float16, device=device)
+            ms_dense = triton.testing.do_bench(
+                lambda: dense_decode_attention(q, k_dense, v_dense, seq_len=L, sm_scale=sm_scale)
+            )
+
+            # Quantize once outside the timed region (setup-time-only, per
+            # the earlier scope call) -- only sparse_decode_attention_quantized
+            # itself is timed.
+            cache = build_quantized_kv_cache(k_compacted, v_compacted)
+            ms_quantized = triton.testing.do_bench(
+                lambda: sparse_decode_attention_quantized(
+                    q, cache["k_residual"], cache["v_residual"],
+                    cache["k_sink_packed"], cache["k_sink_scale"], cache["k_sink_zero"],
+                    cache["v_sink_packed"], cache["v_sink_scale"], cache["v_sink_zero"],
+                    cache["k_win_packed"], cache["k_win_scale"], cache["k_win_zero"],
+                    cache["v_win_packed"], cache["v_win_scale"], cache["v_win_zero"],
+                    seq_len=L, window=W,
+                )
+            )
+
+            # Predicted bytes: real allocated tensor sizes, not a re-derived
+            # formula -- avoids re-deriving the metadata-overhead accounting
+            # (scale/zero-point tensors) from scratch when it's more direct
+            # and more accurate to read .numel()/.element_size() off what's
+            # actually allocated.
+            quant_tensors = [
+                cache["k_residual"], cache["v_residual"],
+                cache["k_sink_packed"], cache["k_sink_scale"], cache["k_sink_zero"],
+                cache["v_sink_packed"], cache["v_sink_scale"], cache["v_sink_zero"],
+                cache["k_win_packed"], cache["k_win_scale"], cache["k_win_zero"],
+                cache["v_win_packed"], cache["v_win_scale"], cache["v_win_zero"],
+            ]
+            bytes_quantized_pred = sum(t.numel() * t.element_size() for t in quant_tensors) \
+                + 2 * q.numel() * q.element_size()   # + Q and O, same fixed term as B_FIXED_FP16
+
+            bytes_sparse_pred = B_FIXED_FP16 + C_FP16 * (W + SINK_SIZE)
+
+            # Marginal multiplier from adding quantization on top of sparsity
+            # -- b/d in Phase 2's own notation (sparse_native_bytes /
+            # quantized_bytes), the ~1.76x prediction from the fp16-baseline
+            # addendum. Not compared against dense here; that ratio (sparsity
+            # alone) is already what benchmark() measures separately.
+            predicted_marginal_multiplier = bytes_sparse_pred / bytes_quantized_pred
+            measured_marginal_multiplier = ms_sparse / ms_quantized
+            gap_pct = 100 * (measured_marginal_multiplier - predicted_marginal_multiplier) / predicted_marginal_multiplier
+
+            results.append({
+                "L": L, "W": W,
+                "ms_dense": ms_dense, "ms_sparse": ms_sparse, "ms_quantized": ms_quantized,
+                "bytes_sparse_pred": bytes_sparse_pred, "bytes_quantized_pred": bytes_quantized_pred,
+                "predicted_marginal_multiplier": predicted_marginal_multiplier,
+                "measured_marginal_multiplier": measured_marginal_multiplier,
+                "gap_pct": gap_pct,
+            })
+
+    return results
+
+
+def _print_and_save_quantized(results, path="benchmark_results_quantized.csv"):
+    import csv
+
+    header = ["L", "W", "ms_dense", "ms_sparse", "ms_quantized",
+             "bytes_sparse_pred", "bytes_quantized_pred",
+             "predicted_marginal_multiplier", "measured_marginal_multiplier", "gap_pct"]
+    print(f"{'L':>7} {'W':>7} {'ms_sparse':>10} {'ms_quant':>10} "
+         f"{'pred_mult':>10} {'meas_mult':>10} {'gap_%':>8}")
+    for r in results:
+        print(f"{r['L']:>7} {r['W']:>7} {r['ms_sparse']:>10.4f} {r['ms_quantized']:>10.4f} "
+             f"{r['predicted_marginal_multiplier']:>10.3f} {r['measured_marginal_multiplier']:>10.3f} "
+             f"{r['gap_pct']:>8.2f}")
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"\nSaved {len(results)} rows to {path}")
+
+
 if __name__ == "__main__":
     _print_and_save(benchmark())
+    _print_and_save_quantized(benchmark_quantized())
