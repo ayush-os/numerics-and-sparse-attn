@@ -613,66 +613,51 @@ def _load_kv_tile_quantized(
     sink_tok_start = slot_start                       # sink's own numbering == physical slot directly
     win_tok_start = slot_start - sink
 
-    # OPTIMIZATION, added after benchmarking: computing all three regime
-    # candidates unconditionally, every tile, measured at converging to
-    # ~3x real memory traffic versus what's structurally needed (SINK=4 is
-    # tiny relative to BLOCK_N, so only the very first tile can ever
-    # contain a sink position, yet every tile was still paying for a full
-    # sink dequant -- same story, smaller effect, for residual on tiles
-    # that are purely sink+window-old). Each candidate's expensive
-    # load/dequant is now skipped via a runtime `if` whenever this tile
-    # provably can't overlap that regime; zero-filled placeholders keep
-    # both branches defining the same variables with matching types (same
-    # discipline as the loop-carried-dtype fix earlier). This is genuinely
-    # new, untested control-flow for this file -- none of the existing
-    # kernels use scalar if/else, only tl.where -- so UNVERIFIED, same as
-    # everything else that's hit a real Triton-version surprise so far.
-    if slot_start < sink:
-        k_sink = _dequantize_k_tile(
-            K_sink_packed_ptr, K_sink_scale_ptr, K_sink_zero_ptr,
-            sink_tok_start, SINK_NUM_PACKED, SINK_NUM_GROUPS,
-            D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
-            GROUP_SIZE, BITS, BLOCK_N,
-        )
-        v_sink = _dequantize_v_tile(
-            V_sink_packed_ptr, V_sink_scale_ptr, V_sink_zero_ptr,
-            sink_tok_start, SINK_SEQ_LEN,
-            D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
-            GROUP_SIZE, BITS, BLOCK_N,
-        )
-    else:
-        k_sink = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
-        v_sink = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
+    # REVERTED runtime-if optimization attempt: measured ~20x SLOWER on
+    # real hardware, not faster -- Triton's scalar if/else here likely
+    # doesn't skip real work the way it does in normal Python (possibly
+    # predicated/masked execution under the hood, plus it may break loop
+    # pipelining), so it added branch overhead on top of the same-or-more
+    # actual work. Back to unconditional compute-all-3 + tl.where, which is
+    # correctness-verified and has a known, quantified ~3x cost. The real
+    # fix for that cost is now at the call-site level instead (see
+    # _sparse_decode_attn_kernel_quantized's 3-segment loop) -- this
+    # function stays general-purpose, used only for the boundary tiles
+    # that genuinely can mix regimes, not for the whole sweep.
+    k_sink = _dequantize_k_tile(
+        K_sink_packed_ptr, K_sink_scale_ptr, K_sink_zero_ptr,
+        sink_tok_start, SINK_NUM_PACKED, SINK_NUM_GROUPS,
+        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+        GROUP_SIZE, BITS, BLOCK_N,
+    )
+    v_sink = _dequantize_v_tile(
+        V_sink_packed_ptr, V_sink_scale_ptr, V_sink_zero_ptr,
+        sink_tok_start, SINK_SEQ_LEN,
+        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+        GROUP_SIZE, BITS, BLOCK_N,
+    )
 
-    if slot_start < WIN_OLD_END:
-        k_old = _dequantize_k_tile(
-            K_win_packed_ptr, K_win_scale_ptr, K_win_zero_ptr,
-            win_tok_start, WIN_NUM_PACKED, WIN_NUM_GROUPS,
-            D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
-            GROUP_SIZE, BITS, BLOCK_N,
-        )
-        v_old = _dequantize_v_tile(
-            V_win_packed_ptr, V_win_scale_ptr, V_win_zero_ptr,
-            win_tok_start, WIN_OLD_LEN,
-            D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
-            GROUP_SIZE, BITS, BLOCK_N,
-        )
-    else:
-        k_old = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
-        v_old = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
+    k_old = _dequantize_k_tile(
+        K_win_packed_ptr, K_win_scale_ptr, K_win_zero_ptr,
+        win_tok_start, WIN_NUM_PACKED, WIN_NUM_GROUPS,
+        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+        GROUP_SIZE, BITS, BLOCK_N,
+    )
+    v_old = _dequantize_v_tile(
+        V_win_packed_ptr, V_win_scale_ptr, V_win_zero_ptr,
+        win_tok_start, WIN_OLD_LEN,
+        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+        GROUP_SIZE, BITS, BLOCK_N,
+    )
 
     # Residual: no packing, direct fp16 load -- own small [.., RESIDUAL_SIZE,
     # D_HEAD] cache, same load shape as _load_kv_tile, just against a
     # smaller, separately-allocated tensor with its own local numbering.
-    if slot_start + BLOCK_N > WIN_OLD_END:
-        res_local_slot = tl.maximum(slot_idx - WIN_OLD_END, 0)
-        res_offset = (idx_in_batch * N_KV_HEADS * RESIDUAL_SIZE * D_HEAD) + \
-                     (kv_head_idx * RESIDUAL_SIZE * D_HEAD + res_local_slot * D_HEAD)
-        k_res = tl.load(K_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
-        v_res = tl.load(V_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
-    else:
-        k_res = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
-        v_res = tl.zeros([BLOCK_N, D_HEAD], dtype=tl.float32)
+    res_local_slot = tl.maximum(slot_idx - WIN_OLD_END, 0)
+    res_offset = (idx_in_batch * N_KV_HEADS * RESIDUAL_SIZE * D_HEAD) + \
+                 (kv_head_idx * RESIDUAL_SIZE * D_HEAD + res_local_slot * D_HEAD)
+    k_res = tl.load(K_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    v_res = tl.load(V_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
 
     # Compute-broadly, select-narrowly: all three candidates were computed
     # safely for the whole tile above; this is the only place that decides
@@ -680,6 +665,40 @@ def _load_kv_tile_quantized(
     k = tl.where(is_sink[:, None], k_sink, tl.where(is_old[:, None], k_old, k_res))
     v = tl.where(is_sink[:, None], v_sink, tl.where(is_old[:, None], v_old, v_res))
 
+    return k, v
+
+
+@triton.jit
+def _load_kv_tile_window_old(
+    K_win_packed_ptr, K_win_scale_ptr, K_win_zero_ptr,
+    V_win_packed_ptr, V_win_scale_ptr, V_win_zero_ptr,
+    win_tok_start, num_packed, num_groups, win_seq_len,
+    D_HEAD: tl.constexpr, idx_in_batch, kv_head_idx, N_KV_HEADS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr, BITS: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """Pure window-old tile load -- no sink or residual candidates computed
+    at all, not skipped via a runtime branch (that's what backfired), just
+    never present in this function's body at all. Used only for the middle
+    stretch of tiles in _sparse_decode_attn_kernel_quantized's 3-segment
+    loop that provably can't be anything but window-old, given sink (4) and
+    the window-old/residual boundary are both fixed, small, and don't
+    scale with WINDOW -- this is where the real W-scaling cost lives, so
+    keeping it branch-free (unlike the failed optimization attempt) is
+    what actually matters. UNVERIFIED, composing two already-verified
+    pieces in a new way.
+    """
+    k = _dequantize_k_tile(
+        K_win_packed_ptr, K_win_scale_ptr, K_win_zero_ptr,
+        win_tok_start, num_packed, num_groups,
+        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+        GROUP_SIZE, BITS, BLOCK_N,
+    )
+    v = _dequantize_v_tile(
+        V_win_packed_ptr, V_win_scale_ptr, V_win_zero_ptr,
+        win_tok_start, win_seq_len,
+        D_HEAD, N_KV_HEADS, idx_in_batch, kv_head_idx,
+        GROUP_SIZE, BITS, BLOCK_N,
+    )
     return k, v
 
 
@@ -716,7 +735,73 @@ def _sparse_decode_attn_kernel_quantized(
     acc = tl.zeros([D_HEAD], dtype=tl.float32)
 
     cache_size = SINK + WINDOW
-    for slot_start in tl.range(0, cache_size, BLOCK_N):
+
+    # 3-segment loop split (the optimization, take 2 -- see
+    # _load_kv_tile_quantized/_load_kv_tile_window_old's comments for why
+    # the first attempt, a runtime `if`, backfired instead). Boundaries
+    # computed here too since the outer kernel needs them as actual Python-
+    # level loop bounds, not just inside a called function. SINK and the
+    # window-old/residual boundary are both small and fixed regardless of
+    # WINDOW, so segments 1 and 3 stay ~1-2 tiles always; only segment 2
+    # scales with WINDOW, which is exactly why it's the one kept branch-free.
+    PACK_FACTOR: tl.constexpr = 8 // BITS
+    WIN_OLD_LEN: tl.constexpr = WINDOW - RESIDUAL_SIZE
+    WIN_OLD_END: tl.constexpr = SINK + WIN_OLD_LEN
+    WIN_OLD_END_ALIGNED: tl.constexpr = (WIN_OLD_END // BLOCK_N) * BLOCK_N
+    SEG3_START: tl.constexpr = max(BLOCK_N, WIN_OLD_END_ALIGNED)
+    WIN_NUM_PACKED: tl.constexpr = WIN_OLD_LEN // PACK_FACTOR
+    WIN_NUM_GROUPS: tl.constexpr = WIN_OLD_LEN // GROUP_SIZE
+
+    # Segment 1: tile 0, always present, unconditionally -- the only tile
+    # that can ever contain a sink position, and (for WINDOW near
+    # RESIDUAL_SIZE) possibly residual too. General-purpose helper, since
+    # this one genuinely might need any/all of the three regimes.
+    slot_start = 0
+    slot_idx, valid = _kv_indices(seq_len, slot_start, WINDOW, SINK, BLOCK_N)
+    k, v = _load_kv_tile_quantized(
+        K_cache_ptr, V_cache_ptr,
+        K_sink_packed_ptr, K_sink_scale_ptr, K_sink_zero_ptr,
+        V_sink_packed_ptr, V_sink_scale_ptr, V_sink_zero_ptr,
+        K_win_packed_ptr, K_win_scale_ptr, K_win_zero_ptr,
+        V_win_packed_ptr, V_win_scale_ptr, V_win_zero_ptr,
+        slot_start, slot_idx, valid, D_HEAD, pid_batch, kv_head,
+        WINDOW, SINK, N_KV_HEADS, RESIDUAL_SIZE, GROUP_SIZE, BITS, BLOCK_N,
+    )
+    qk = tl.sum(q[None, :] * k, axis=1) * sm_scale
+    qk = tl.where(valid, qk, float("-inf"))
+    m_ij = tl.maximum(m_i, tl.max(qk, axis=0))
+    p = tl.math.exp(qk - m_ij)
+    alpha = tl.math.exp(m_i - m_ij)
+    l_i = l_i * alpha + tl.sum(p, axis=0)
+    acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+    m_i = m_ij
+
+    # Segment 2: pure window-old, branch-free -- where the real
+    # WINDOW-scaling cost lives, so this is the segment the whole
+    # optimization is actually for.
+    for slot_start in tl.range(BLOCK_N, SEG3_START, BLOCK_N):
+        slot_idx, valid = _kv_indices(seq_len, slot_start, WINDOW, SINK, BLOCK_N)
+        win_tok_start = slot_start - SINK
+        k, v = _load_kv_tile_window_old(
+            K_win_packed_ptr, K_win_scale_ptr, K_win_zero_ptr,
+            V_win_packed_ptr, V_win_scale_ptr, V_win_zero_ptr,
+            win_tok_start, WIN_NUM_PACKED, WIN_NUM_GROUPS, WIN_OLD_LEN,
+            D_HEAD, pid_batch, kv_head, N_KV_HEADS,
+            GROUP_SIZE, BITS, BLOCK_N,
+        )
+        qk = tl.sum(q[None, :] * k, axis=1) * sm_scale
+        qk = tl.where(valid, qk, float("-inf"))
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=0))
+        p = tl.math.exp(qk - m_ij)
+        alpha = tl.math.exp(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        m_i = m_ij
+
+    # Segment 3: boundary (window-old meets residual) + pure residual --
+    # small and fixed-size regardless of WINDOW (~1-2 tiles), so reusing
+    # the general-purpose helper here is cheap.
+    for slot_start in tl.range(SEG3_START, cache_size, BLOCK_N):
         slot_idx, valid = _kv_indices(seq_len, slot_start, WINDOW, SINK, BLOCK_N)
         k, v = _load_kv_tile_quantized(
             K_cache_ptr, V_cache_ptr,
@@ -727,7 +812,6 @@ def _sparse_decode_attn_kernel_quantized(
             slot_start, slot_idx, valid, D_HEAD, pid_batch, kv_head,
             WINDOW, SINK, N_KV_HEADS, RESIDUAL_SIZE, GROUP_SIZE, BITS, BLOCK_N,
         )
-
         qk = tl.sum(q[None, :] * k, axis=1) * sm_scale
         qk = tl.where(valid, qk, float("-inf"))
         m_ij = tl.maximum(m_i, tl.max(qk, axis=0))
