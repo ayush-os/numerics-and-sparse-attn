@@ -457,7 +457,14 @@ def _dequantize_k_tile(
     # access risk, not just a "computes garbage that gets discarded" one.
     # The caller's tl.where discards these results anyway; clamping just
     # makes computing them safe in the first place.
-    byte_idx = tl.minimum(byte_idx, num_packed - 1)
+    #
+    # Lower-bound clamp (tl.maximum(..., 0)) added after a real bug: tok_start
+    # can now be NEGATIVE (the caller stopped clamping it at the tile level,
+    # since that clamp was corrupting real in-range positions -- see
+    # _load_kv_tile_quantized). Clamping per-position here, after the
+    # tok_start+tok_in_tile arithmetic, is what actually keeps real in-range
+    # positions correct while still making out-of-range ones safe.
+    byte_idx = tl.maximum(tl.minimum(byte_idx, num_packed - 1), 0)
 
     packed_base = (idx_in_batch * N_KV_HEADS + kv_head_idx) * num_packed * D_HEAD
     meta_base = (idx_in_batch * N_KV_HEADS + kv_head_idx) * num_groups * D_HEAD
@@ -513,7 +520,11 @@ def _dequantize_v_tile(
     # out-of-regime call (this sub-block spans less than the full tile)
     # can't compute an out-of-bounds address. `seq_len` here is this
     # sub-block's own length, doubling as the clamp bound.
-    tok_idx = tl.minimum(tok_start + tok_in_tile, seq_len - 1)
+    #
+    # Lower-bound clamp added after the same real bug as _dequantize_k_tile:
+    # tok_start can now be negative (see _load_kv_tile_quantized) -- clamp
+    # per-position, after the addition, not by clamping tok_start itself.
+    tok_idx = tl.maximum(tl.minimum(tok_start + tok_in_tile, seq_len - 1), 0)
 
     packed_chan_idx = d_idx // PACK_FACTOR      # (D_HEAD,) -- which of the D_PACKED=32 packed slots
     sub_pos = d_idx % PACK_FACTOR                # (D_HEAD,)
@@ -590,10 +601,17 @@ def _load_kv_tile_quantized(
     is_old = (slot_idx >= sink) & (slot_idx < WIN_OLD_END)
     # is_residual is implicit -- the else-branch of the final tl.where below.
 
-    # Local offsets, one per regime, clamped non-negative (upper-bound
-    # clamping happens inside the dequant functions themselves now).
+    # REAL BUG FOUND ON HARDWARE: win_tok_start used to be clamped to 0
+    # here (tl.maximum(slot_start - sink, 0)), which corrupted the whole
+    # first tile's window-old positions, not just the truly-invalid ones --
+    # clamping the tile-level starting scalar breaks the tok_start +
+    # tok_in_tile relationship for every position in that tile, shifting
+    # real window-old positions forward by exactly `sink` tokens. Fixed by
+    # NOT clamping here -- let it go negative, and clamp per-position
+    # instead, inside the dequant functions (which already had an
+    # upper-bound clamp; now also a lower-bound one).
     sink_tok_start = slot_start                       # sink's own numbering == physical slot directly
-    win_tok_start = tl.maximum(slot_start - sink, 0)
+    win_tok_start = slot_start - sink
 
     k_sink = _dequantize_k_tile(
         K_sink_packed_ptr, K_sink_scale_ptr, K_sink_zero_ptr,
