@@ -236,9 +236,15 @@ def _quantize_k_kernel(
         x_max = tl.max(x, axis=0)
         scale = (x_max - x_min) / QMAX
         scale = tl.where(scale == 0, 1.0, scale)   # guard a constant (all-equal) group
-        zero_point = tl.math.round(-x_min / scale)
+        # tl.math.round doesn't exist in this Triton version (found on real
+        # hardware -- tl.math.exp does, so it's specifically round that's
+        # missing, not the whole module). floor(x+0.5) is a portable
+        # round-half-up substitute; exact .5-boundary tie-breaking differs
+        # slightly from Python's round-half-to-even, but that's a rare,
+        # sub-LSB-scale difference, not worth chasing here.
+        zero_point = tl.floor(-x_min / scale + 0.5)
 
-        q = tl.math.round(x / scale[None, :]) + zero_point[None, :]
+        q = tl.floor(x / scale[None, :] + 0.5) + zero_point[None, :]
         # CHECK #2: .to(tl.uint8) after clamping into [0, QMAX] — confirm
         # this cast behaves as a plain truncating int cast, not something
         # stranger, for a tensor that's still logically float here.
@@ -340,9 +346,12 @@ def _quantize_v_kernel(
             x_max = tl.max(x, axis=1)
             scale = (x_max - x_min) / QMAX
             scale = tl.where(scale == 0, 1.0, scale)   # guard a constant group
-            zero_point = tl.math.round(-x_min / scale)
+            # tl.math.round doesn't exist in this Triton version -- see
+            # _quantize_k_kernel's identical fix for why floor(x+0.5) is
+            # used instead.
+            zero_point = tl.floor(-x_min / scale + 0.5)
 
-            q = tl.math.round(x / scale[:, None]) + zero_point[:, None]
+            q = tl.floor(x / scale[:, None] + 0.5) + zero_point[:, None]
             # CHECK #2: same uint8-cast concern as _quantize_k_kernel.
             q = tl.minimum(tl.maximum(q, 0.0), float(QMAX)).to(tl.uint8)   # (BLOCK_N, GROUP_SIZE)
 
