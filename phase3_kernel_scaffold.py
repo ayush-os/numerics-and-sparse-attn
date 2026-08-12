@@ -627,8 +627,15 @@ def _load_kv_tile_quantized(
     res_local_slot = tl.maximum(slot_idx - WIN_OLD_END, 0)
     res_offset = (idx_in_batch * N_KV_HEADS * RESIDUAL_SIZE * D_HEAD) + \
                  (kv_head_idx * RESIDUAL_SIZE * D_HEAD + res_local_slot * D_HEAD)
-    k_res = tl.load(K_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0)
-    v_res = tl.load(V_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0)
+    # REAL BUG FOUND ON HARDWARE: k_sink/k_old/v_sink/v_old come back from
+    # _dequantize_k_tile/_dequantize_v_tile as fp32, but this residual load
+    # was left at K_cache_ptr/V_cache_ptr's native fp16 -- the tl.where
+    # below combined mismatched dtypes across branches. Explicit upcast
+    # fixes it; error was residual-specific and shrank as WINDOW grew
+    # (residual's fixed RESIDUAL_SIZE becomes a smaller fraction of the
+    # total cache at larger WINDOW), which is what pointed here.
+    k_res = tl.load(K_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    v_res = tl.load(V_cache_ptr + res_offset[:, None] + d_idx[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
 
     # Compute-broadly, select-narrowly: all three candidates were computed
     # safely for the whole tile above; this is the only place that decides
