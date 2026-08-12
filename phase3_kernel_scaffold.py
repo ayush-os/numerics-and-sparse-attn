@@ -259,17 +259,22 @@ def _quantize_k_kernel(
         # Slightly redundant re-loading of K from HBM; acceptable since this
         # kernel is setup-time-only, not perf-critical.
         byte_in_group = tl.arange(0, BYTES_PER_GROUP)
-        packed = tl.zeros([BYTES_PER_GROUP, D_HEAD], dtype=tl.uint8)
+        # int32 accumulator, not uint8: Triton's type promotion on |=/<<
+        # silently widens uint8 to int32, and a loop-carried variable's
+        # type has to stay fixed across iterations -- found on hardware
+        # ("Loop-carried variable packed has initial type uint8 but is
+        # re-assigned to int32"). Cast down to uint8 once, at the store.
+        packed = tl.zeros([BYTES_PER_GROUP, D_HEAD], dtype=tl.int32)
         for j in range(PACK_FACTOR):   # constexpr -> unrolled
             tok_idx_j = group * GROUP_SIZE + j + PACK_FACTOR * byte_in_group   # (BYTES_PER_GROUP,)
             offs_j = k_base + tok_idx_j[:, None] * D_HEAD + d_idx[None, :]     # (BYTES_PER_GROUP, D_HEAD)
             x_j = tl.load(K_ptr + offs_j)
             q_j = tl.floor(x_j / scale[None, :] + 0.5) + zero_point[None, :]
-            q_j = tl.minimum(tl.maximum(q_j, 0.0), float(QMAX)).to(tl.uint8)
+            q_j = tl.minimum(tl.maximum(q_j, 0.0), float(QMAX)).to(tl.int32)
             packed |= (q_j << (j * BITS))
 
         byte_idx = group * BYTES_PER_GROUP + byte_in_group   # (BYTES_PER_GROUP,)
-        tl.store(Packed_ptr + packed_base + byte_idx[:, None] * D_HEAD + d_idx[None, :], packed)
+        tl.store(Packed_ptr + packed_base + byte_idx[:, None] * D_HEAD + d_idx[None, :], packed.to(tl.uint8))
 
 
 def quantize_k_cache(k, group_size=GROUP_SIZE, bits=QUANT_BITS):
@@ -364,19 +369,21 @@ def _quantize_v_kernel(
             # supported on this Triton version. Fixed the same way -- fresh
             # strided loads per j (along the channel axis this time, not
             # the token axis) instead of slicing one big computed tensor.
+            # int32 accumulator, not uint8 -- same loop-carried-type fix as
+            # _quantize_k_kernel, see that comment for why.
             byte_in_group = tl.arange(0, BYTES_PER_GROUP)
-            packed = tl.zeros([BLOCK_N, BYTES_PER_GROUP], dtype=tl.uint8)
+            packed = tl.zeros([BLOCK_N, BYTES_PER_GROUP], dtype=tl.int32)
             for j in range(PACK_FACTOR):    # constexpr -> unrolled
                 chan_idx_j = group * GROUP_SIZE + j + PACK_FACTOR * byte_in_group   # (BYTES_PER_GROUP,)
                 offs_j = v_base + tok_idx[:, None] * D_HEAD + chan_idx_j[None, :]   # (BLOCK_N, BYTES_PER_GROUP)
                 x_j = tl.load(V_ptr + offs_j, mask=valid[:, None], other=0.0)
                 q_j = tl.floor(x_j / scale[:, None] + 0.5) + zero_point[:, None]
-                q_j = tl.minimum(tl.maximum(q_j, 0.0), float(QMAX)).to(tl.uint8)
+                q_j = tl.minimum(tl.maximum(q_j, 0.0), float(QMAX)).to(tl.int32)
                 packed |= (q_j << (j * BITS))
 
             packed_chan_idx = group * BYTES_PER_GROUP + byte_in_group   # (BYTES_PER_GROUP,)
             packed_off = packed_base + tok_idx[:, None] * D_PACKED + packed_chan_idx[None, :]
-            tl.store(Packed_ptr + packed_off, packed, mask=valid[:, None])
+            tl.store(Packed_ptr + packed_off, packed.to(tl.uint8), mask=valid[:, None])
 
 
 def quantize_v_cache(v, group_size=GROUP_SIZE, bits=QUANT_BITS):
