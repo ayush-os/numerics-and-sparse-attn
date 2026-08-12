@@ -244,29 +244,32 @@ def _quantize_k_kernel(
         # sub-LSB-scale difference, not worth chasing here.
         zero_point = tl.floor(-x_min / scale + 0.5)
 
-        q = tl.floor(x / scale[None, :] + 0.5) + zero_point[None, :]
-        # CHECK #2: .to(tl.uint8) after clamping into [0, QMAX] — confirm
-        # this cast behaves as a plain truncating int cast, not something
-        # stranger, for a tensor that's still logically float here.
-        q = tl.minimum(tl.maximum(q, 0.0), float(QMAX)).to(tl.uint8)  # (GROUP_SIZE, D_HEAD)
-
         meta_off = meta_base + group * D_HEAD + d_idx
         tl.store(Scale_ptr + meta_off, scale)
         tl.store(Zero_ptr + meta_off, zero_point)
 
-        for b in range(BYTES_PER_GROUP):   # BYTES_PER_GROUP is constexpr -> unrolled, fine
-            packed = tl.zeros([D_HEAD], dtype=tl.uint8)
-            for j in range(PACK_FACTOR):   # also constexpr -> unrolled
-                # CHECK #3: q[b*PACK_FACTOR+j, :] — indexing a single row out
-                # of a loaded 2D tile with a compile-time-constant row index
-                # (b, j are plain Python ints here since both loops are
-                # unrolled, not tl.range). I believe this is valid Triton,
-                # but it's exactly the kind of thing your own bug list
-                # (tl.cat reorder ambiguity, tl.arange constraints) suggests
-                # is worth not trusting blind.
-                packed |= (q[b * PACK_FACTOR + j, :] << (j * BITS))
-            byte_idx = group * BYTES_PER_GROUP + b
-            tl.store(Packed_ptr + packed_base + byte_idx * D_HEAD + d_idx, packed)
+        # REAL BUG FOUND ON HARDWARE (was CHECK #3): indexing a row out of an
+        # already-computed tensor with a non-Python-int index isn't
+        # supported on this Triton version ("unsupported tensor index:
+        # int32[]"). Fixed by never computing one big (GROUP_SIZE, D_HEAD)
+        # quantized tensor and slicing it -- instead compute PACK_FACTOR
+        # separate (BYTES_PER_GROUP, D_HEAD) tensors directly via fresh
+        # strided loads from K_ptr, then combine with plain elementwise ops.
+        # Same broadcast-only style already used in the dequant functions.
+        # Slightly redundant re-loading of K from HBM; acceptable since this
+        # kernel is setup-time-only, not perf-critical.
+        byte_in_group = tl.arange(0, BYTES_PER_GROUP)
+        packed = tl.zeros([BYTES_PER_GROUP, D_HEAD], dtype=tl.uint8)
+        for j in range(PACK_FACTOR):   # constexpr -> unrolled
+            tok_idx_j = group * GROUP_SIZE + j + PACK_FACTOR * byte_in_group   # (BYTES_PER_GROUP,)
+            offs_j = k_base + tok_idx_j[:, None] * D_HEAD + d_idx[None, :]     # (BYTES_PER_GROUP, D_HEAD)
+            x_j = tl.load(K_ptr + offs_j)
+            q_j = tl.floor(x_j / scale[None, :] + 0.5) + zero_point[None, :]
+            q_j = tl.minimum(tl.maximum(q_j, 0.0), float(QMAX)).to(tl.uint8)
+            packed |= (q_j << (j * BITS))
+
+        byte_idx = group * BYTES_PER_GROUP + byte_in_group   # (BYTES_PER_GROUP,)
+        tl.store(Packed_ptr + packed_base + byte_idx[:, None] * D_HEAD + d_idx[None, :], packed)
 
 
 def quantize_k_cache(k, group_size=GROUP_SIZE, bits=QUANT_BITS):
@@ -351,25 +354,29 @@ def _quantize_v_kernel(
             # used instead.
             zero_point = tl.floor(-x_min / scale + 0.5)
 
-            q = tl.floor(x / scale[:, None] + 0.5) + zero_point[:, None]
-            # CHECK #2: same uint8-cast concern as _quantize_k_kernel.
-            q = tl.minimum(tl.maximum(q, 0.0), float(QMAX)).to(tl.uint8)   # (BLOCK_N, GROUP_SIZE)
-
             meta_off = meta_base + tok_idx * NUM_CHAN_GROUPS + group
             tl.store(Scale_ptr + meta_off, scale, mask=valid)
             tl.store(Zero_ptr + meta_off, zero_point, mask=valid)
 
-            for b in range(BYTES_PER_GROUP):    # constexpr (8) -> unrolled
-                packed = tl.zeros([BLOCK_N], dtype=tl.uint8)
-                for j in range(PACK_FACTOR):     # constexpr (4) -> unrolled
-                    # CHECK #3: q[:, b*PACK_FACTOR+j] -- indexing a single
-                    # COLUMN out of the tile this time (mirror of K's
-                    # single-ROW indexing). Same "verify, don't trust blind"
-                    # flag as before.
-                    packed |= (q[:, b * PACK_FACTOR + j] << (j * BITS))
-                packed_chan_idx = group * BYTES_PER_GROUP + b
-                packed_off = packed_base + tok_idx * D_PACKED + packed_chan_idx
-                tl.store(Packed_ptr + packed_off, packed, mask=valid)
+            # REAL BUG FOUND ON HARDWARE (was CHECK #3, mirror of the same
+            # fix in _quantize_k_kernel): indexing a column out of an
+            # already-computed tensor with a non-Python-int index isn't
+            # supported on this Triton version. Fixed the same way -- fresh
+            # strided loads per j (along the channel axis this time, not
+            # the token axis) instead of slicing one big computed tensor.
+            byte_in_group = tl.arange(0, BYTES_PER_GROUP)
+            packed = tl.zeros([BLOCK_N, BYTES_PER_GROUP], dtype=tl.uint8)
+            for j in range(PACK_FACTOR):    # constexpr -> unrolled
+                chan_idx_j = group * GROUP_SIZE + j + PACK_FACTOR * byte_in_group   # (BYTES_PER_GROUP,)
+                offs_j = v_base + tok_idx[:, None] * D_HEAD + chan_idx_j[None, :]   # (BLOCK_N, BYTES_PER_GROUP)
+                x_j = tl.load(V_ptr + offs_j, mask=valid[:, None], other=0.0)
+                q_j = tl.floor(x_j / scale[:, None] + 0.5) + zero_point[:, None]
+                q_j = tl.minimum(tl.maximum(q_j, 0.0), float(QMAX)).to(tl.uint8)
+                packed |= (q_j << (j * BITS))
+
+            packed_chan_idx = group * BYTES_PER_GROUP + byte_in_group   # (BYTES_PER_GROUP,)
+            packed_off = packed_base + tok_idx[:, None] * D_PACKED + packed_chan_idx[None, :]
+            tl.store(Packed_ptr + packed_off, packed, mask=valid[:, None])
 
 
 def quantize_v_cache(v, group_size=GROUP_SIZE, bits=QUANT_BITS):
